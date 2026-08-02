@@ -1,0 +1,1000 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ApiError, createApiClient } from "./apiClient";
+import AttachmentComposer from "./AttachmentComposer";
+import AnalysisResultReview from "./AnalysisResultReview";
+import AppShell from "./AppShell";
+import ClarificationTrace from "./ClarificationTrace";
+import { DEFAULT_API_BASE } from "./config";
+import ConversationMessage from "./ConversationMessage";
+import DbRagReview from "./DbRagReview";
+import DbRagDatasetReview from "./DbRagDatasetReview";
+import Clarification from "./Clarification";
+import ConversationHistory from "./ConversationHistory";
+import ModelOutputLimit from "./ModelOutputLimit";
+import type {
+  ApiThreadState,
+  ActiveInterrupt,
+  AttachmentManifestSummary,
+  AttachmentUploadError,
+  ClarificationExchange,
+  ConversationMessage as ConversationMessageType,
+  ResumeInterruptPayload,
+  RuntimeOptions,
+  RuntimeSettings,
+  ConversationSummary,
+} from "./types";
+import { AGENT_DECIDE_ANSWER } from "./types";
+import type { FormEvent, KeyboardEvent } from "react";
+
+interface Props {
+  fetchImpl?: typeof fetch;
+  apiBase?: string;
+  loadConversationHistory?: boolean;
+}
+
+const POLL_INTERVAL_MS = 1000;
+
+function assertNever(value: never): never {
+  throw new Error(`Unsupported interrupt: ${JSON.stringify(value)}`);
+}
+
+const EMPTY_RUNTIME_SETTINGS: RuntimeSettings = {
+  model_name: "",
+  temperature: null,
+  top_p: null,
+  max_steps: null,
+  timeout_seconds: null,
+  db_rag_embedding_model: "",
+  db_rag_reranker_model: "",
+};
+
+function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    const detail =
+      typeof error.detail === "string"
+        ? error.detail
+        : error.detail
+          ? JSON.stringify(error.detail)
+          : error.message;
+    return `${error.status}: ${detail}`;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "An unexpected error occurred.";
+}
+
+export function isPendingMessageAcknowledged(
+  conversationMessage: ConversationMessageType,
+  pendingMessage: ConversationMessageType,
+): boolean {
+  const attachmentIds = (message: ConversationMessageType) =>
+    (message.attachments ?? [])
+      .map((attachment) => attachment.id)
+      .sort()
+      .join("\u0000");
+  return (
+    conversationMessage.role === "user" &&
+    conversationMessage.text === pendingMessage.text &&
+    attachmentIds(conversationMessage) === attachmentIds(pendingMessage)
+  );
+}
+
+function diagnosticText(value: unknown): string {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function activityStatusText(_state: ApiThreadState | null): string {
+  return "Working on your request.";
+}
+
+function isDatasetReviewCompletionMessage(
+  message: ConversationMessageType,
+  datasetId: string | null,
+) {
+  if (!datasetId || message.role !== "assistant") {
+    return false;
+  }
+  const escapedDatasetId = datasetId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `Dataset\\s+\`${escapedDatasetId}\`\\s+was created`,
+    "i",
+  ).test(message.text);
+}
+
+interface ActivityMessageProps {
+  detail: string;
+  steps: number | null | undefined;
+  title: string;
+}
+
+function ActivityMessage({ detail, steps, title }: ActivityMessageProps) {
+  return (
+    <li className="message message-assistant message-activity">
+      <section
+        aria-label="Agent activity"
+        aria-live="polite"
+        className="activity-panel"
+      >
+        <span className="activity-spinner" aria-hidden="true" />
+        <div>
+          <h3>{title}</h3>
+          <p>{detail}</p>
+          {steps ? (
+            <p className="activity-meta">Completed graph steps: {steps}</p>
+          ) : null}
+        </div>
+      </section>
+    </li>
+  );
+}
+
+export default function App({
+  fetchImpl,
+  apiBase = DEFAULT_API_BASE,
+  loadConversationHistory = true,
+}: Props) {
+  const apiClient = useMemo(
+    () => createApiClient({ apiBase, fetchImpl }),
+    [apiBase, fetchImpl],
+  );
+  const createThreadPromiseRef = useRef<Promise<string> | null>(null);
+  const runtimeOptionsPromiseRef = useRef<ReturnType<
+    typeof apiClient.getRuntimeOptions
+  > | null>(null);
+  const savedConversationsRequestRef = useRef(0);
+  const pollGenerationRef = useRef(0);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [state, setState] = useState<ApiThreadState | null>(null);
+  const [runtimeOptions, setRuntimeOptions] = useState<RuntimeOptions | null>(
+    null,
+  );
+  const [savedConversations, setSavedConversations] = useState<ConversationSummary[]>([]);
+  const [selectedRuntimeSettings, setSelectedRuntimeSettings] =
+    useState<RuntimeSettings>(EMPTY_RUNTIME_SETTINGS);
+  const [message, setMessage] = useState("");
+  const [pendingUserMessage, setPendingUserMessage] =
+    useState<ConversationMessageType | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [runFailureMessage, setRunFailureMessage] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
+  const [stagedAttachments, setStagedAttachments] = useState<
+    AttachmentManifestSummary[]
+  >([]);
+  const [attachmentErrors, setAttachmentErrors] = useState<
+    AttachmentUploadError[]
+  >([]);
+  const [isUploadingAttachments, setIsUploadingAttachments] = useState(false);
+  const [submittedClarifications, setSubmittedClarifications] = useState<
+    Record<string, ClarificationExchange>
+  >({});
+  const [isModelLockHintVisible, setIsModelLockHintVisible] = useState(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    runtimeOptionsPromiseRef.current ??= apiClient.getRuntimeOptions();
+
+    runtimeOptionsPromiseRef.current
+      .then((options) => {
+        if (isMounted) {
+          setRuntimeOptions(options);
+          setSelectedRuntimeSettings(options.defaults);
+        }
+      })
+      .catch((optionsError: unknown) => {
+        if (isMounted) {
+          setError(errorMessage(optionsError));
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [apiClient]);
+
+  useEffect(() => {
+    if (!loadConversationHistory) {
+      return;
+    }
+    void refreshSavedConversations();
+  }, [apiClient, loadConversationHistory]);
+
+  useEffect(() => {
+    if (state?.runtime_settings) {
+      setSelectedRuntimeSettings(state.runtime_settings);
+    }
+  }, [state?.runtime_settings]);
+
+  const projectedClarificationIds = new Set(
+    (state?.conversation ?? []).flatMap((conversationMessage) =>
+      (conversationMessage.clarifications ?? []).map(
+        (clarification) => clarification.interrupt_id,
+      ),
+    ),
+  );
+  const optimisticClarifications = Object.values(submittedClarifications).filter(
+    (clarification) => !projectedClarificationIds.has(clarification.interrupt_id),
+  );
+
+  useEffect(() => {
+    setSubmittedClarifications((current) => {
+      const pending = Object.fromEntries(
+        Object.entries(current).filter(
+          ([interruptId]) => !projectedClarificationIds.has(interruptId),
+        ),
+      );
+      return Object.keys(pending).length === Object.keys(current).length
+        ? current
+        : pending;
+    });
+  }, [state]);
+
+  function applyThreadState(nextState: ApiThreadState) {
+    if (nextState.runtime_settings) {
+      setSelectedRuntimeSettings(nextState.runtime_settings);
+    } else if (nextState.model_name) {
+      setSelectedRuntimeSettings((current) => ({
+        ...current,
+        model_name: nextState.model_name ?? current.model_name,
+      }));
+    }
+    if (
+      (nextState.run.state === "error" || nextState.run.state === "timeout") &&
+      nextState.run.user_message
+    ) {
+      setRunFailureMessage(nextState.run.user_message);
+    } else if (nextState.run.state !== "running") {
+      setRunFailureMessage(null);
+    }
+    setState(nextState);
+  }
+
+  async function refreshSavedConversations() {
+    const requestId = savedConversationsRequestRef.current + 1;
+    savedConversationsRequestRef.current = requestId;
+    try {
+      const response = await apiClient.listConversations();
+      if (requestId === savedConversationsRequestRef.current) {
+        setSavedConversations(response.items ?? []);
+      }
+    } catch {
+      // A history refresh must not block the active analysis workflow.
+    }
+  }
+
+  async function openConversation(nextThreadId: string) {
+    try {
+      const nextState = await apiClient.getThreadState(nextThreadId);
+      setThreadId(nextThreadId);
+      applyThreadState(nextState);
+      const opened = await apiClient.markConversationOpened(nextThreadId);
+      setSavedConversations((current) =>
+        current.map((item) =>
+          item.thread_id === nextThreadId ? opened : item,
+        ),
+      );
+      void refreshSavedConversations();
+      setError(null);
+    } catch (openError) {
+      setError(errorMessage(openError));
+    }
+  }
+
+  async function renameConversation(threadIdToRename: string, title: string) {
+    try {
+      const renamed = await apiClient.renameConversation(threadIdToRename, title);
+      setSavedConversations((current) =>
+        current.map((item) =>
+          item.thread_id === threadIdToRename ? renamed : item,
+        ),
+      );
+      setError(null);
+    } catch (renameError) {
+      setError(errorMessage(renameError));
+      throw renameError;
+    }
+  }
+
+  async function archiveConversation(threadIdToArchive: string) {
+    try {
+      const archived = await apiClient.archiveConversation(threadIdToArchive);
+      setSavedConversations((current) =>
+        current.map((item) =>
+          item.thread_id === threadIdToArchive ? archived : item,
+        ),
+      );
+      if (threadId === threadIdToArchive) {
+        newConversation();
+      }
+      setError(null);
+    } catch (archiveError) {
+      setError(errorMessage(archiveError));
+      throw archiveError;
+    }
+  }
+
+  async function restoreConversation(threadIdToRestore: string) {
+    try {
+      const restored = await apiClient.restoreConversation(threadIdToRestore);
+      setSavedConversations((current) =>
+        current.map((item) =>
+          item.thread_id === threadIdToRestore ? restored : item,
+        ),
+      );
+      await openConversation(threadIdToRestore);
+      setError(null);
+    } catch (restoreError) {
+      setError(errorMessage(restoreError));
+      throw restoreError;
+    }
+  }
+
+  async function deleteConversation(threadIdToDelete: string) {
+    try {
+      await apiClient.deleteConversation(threadIdToDelete);
+      setSavedConversations((current) =>
+        current.filter((item) => item.thread_id !== threadIdToDelete),
+      );
+      if (threadId === threadIdToDelete) {
+        newConversation();
+      }
+      setError(null);
+    } catch (deleteError) {
+      setError(errorMessage(deleteError));
+      throw deleteError;
+    }
+  }
+
+  useEffect(() => {
+    if (!threadId || state?.run.state !== "running") {
+      return;
+    }
+
+    const activeThreadId = threadId;
+    let timeoutId: number | undefined;
+    let isCancelled = false;
+    const generation = pollGenerationRef.current + 1;
+    pollGenerationRef.current = generation;
+
+    async function pollOnce() {
+      try {
+        const nextState = await apiClient.getThreadState(activeThreadId);
+        if (isCancelled || pollGenerationRef.current !== generation) {
+          return;
+        }
+
+        applyThreadState(nextState);
+        setError(null);
+
+        if (nextState.run.state === "running") {
+          timeoutId = window.setTimeout(pollOnce, POLL_INTERVAL_MS);
+        }
+      } catch (pollError) {
+        if (!isCancelled && pollGenerationRef.current === generation) {
+          setError(errorMessage(pollError));
+          timeoutId = window.setTimeout(pollOnce, POLL_INTERVAL_MS);
+        }
+      }
+    }
+
+    timeoutId = window.setTimeout(pollOnce, POLL_INTERVAL_MS);
+
+    return () => {
+      isCancelled = true;
+      pollGenerationRef.current += 1;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [apiClient, state?.run.state, threadId]);
+
+  async function handleRequestError(
+    requestError: unknown,
+    activeThreadId: string,
+  ) {
+    if (requestError instanceof ApiError && requestError.status === 409) {
+      try {
+        const refreshedState = await apiClient.getThreadState(activeThreadId);
+        applyThreadState(refreshedState);
+      } catch {
+        // Keep the original conflict visible if the refresh also fails.
+      }
+    }
+
+    setError(errorMessage(requestError));
+  }
+
+  async function ensureThread() {
+    if (threadId) {
+      return threadId;
+    }
+    if (!runtimeOptions) {
+      return null;
+    }
+
+    createThreadPromiseRef.current ??= apiClient
+      .createThread(selectedRuntimeSettings.model_name)
+      .then((response) => response.thread_id)
+      .catch((createError: unknown) => {
+        createThreadPromiseRef.current = null;
+        throw createError;
+      });
+
+    const nextThreadId = await createThreadPromiseRef.current;
+    setThreadId(nextThreadId);
+    return nextThreadId;
+  }
+
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const text = message.trim();
+    const attachmentIds = stagedAttachments.map(
+      (attachment) => attachment.id,
+    );
+    if (
+      (!text && !attachmentIds.length) ||
+      !runtimeOptions ||
+      isSubmitting ||
+      isResuming ||
+      isUploadingAttachments ||
+      attachmentErrors.length > 0 ||
+      state?.run.state === "running"
+    ) {
+      return;
+    }
+
+    const optimisticMessageId = `pending-user-${Date.now()}`;
+    const optimisticMessage: ConversationMessageType = {
+      id: optimisticMessageId,
+      role: "user",
+      text,
+      created_at: null,
+      attachments: stagedAttachments.map((attachment) => ({
+        id: attachment.id,
+        kind: attachment.kind,
+        label: attachment.filename,
+        filename: attachment.filename,
+        mime: attachment.mime,
+        byte_size: attachment.byte_size,
+        relationship: "input",
+        origin_message_id: optimisticMessageId,
+      })),
+    };
+    setIsSubmitting(true);
+    setPendingUserMessage(optimisticMessage);
+    setMessage("");
+    let activeThreadId: string | null = null;
+    try {
+      activeThreadId = await ensureThread();
+      if (!activeThreadId) {
+        setPendingUserMessage(null);
+        setMessage(text);
+        return;
+      }
+
+      const nextState = await apiClient.submitMessage(
+        activeThreadId,
+        text,
+        attachmentIds,
+      );
+      applyThreadState(nextState);
+      if (loadConversationHistory) {
+        void refreshSavedConversations();
+        window.setTimeout(() => {
+          void refreshSavedConversations();
+        }, 1000);
+      }
+      setStagedAttachments([]);
+      setAttachmentErrors([]);
+      setError(null);
+    } catch (submitError) {
+      setPendingUserMessage(null);
+      setMessage(text);
+      if (activeThreadId) {
+        await handleRequestError(submitError, activeThreadId);
+      } else {
+        setError(errorMessage(submitError));
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function selectAttachments(files: File[]) {
+    if (!runtimeOptions || !files.length || isBusy) {
+      return;
+    }
+    setIsUploadingAttachments(true);
+    let activeThreadId: string | null = null;
+    try {
+      activeThreadId = await ensureThread();
+      if (!activeThreadId) {
+        return;
+      }
+      const result = await apiClient.uploadAttachments(activeThreadId, files);
+      setStagedAttachments((current) => {
+        const byId = new Map(
+          [...current, ...result.attachments].map((item) => [item.id, item]),
+        );
+        return [...byId.values()];
+      });
+      const attemptedFilenames = new Set(files.map((file) => file.name));
+      setAttachmentErrors((current) => [
+        ...current.filter(
+          (uploadError) => !attemptedFilenames.has(uploadError.filename),
+        ),
+        ...result.errors,
+      ]);
+      setError(null);
+    } catch (uploadError) {
+      if (activeThreadId) {
+        await handleRequestError(uploadError, activeThreadId);
+      } else {
+        setError(errorMessage(uploadError));
+      }
+    } finally {
+      setIsUploadingAttachments(false);
+    }
+  }
+
+  async function removeStagedAttachment(attachmentId: string) {
+    if (!threadId || isBusy) {
+      return;
+    }
+    try {
+      await apiClient.discardStagedAttachment(threadId, attachmentId);
+      setStagedAttachments((current) =>
+        current.filter((attachment) => attachment.id !== attachmentId),
+      );
+      setError(null);
+    } catch (removeError) {
+      await handleRequestError(removeError, threadId);
+    }
+  }
+
+  function dismissAttachmentError(index: number) {
+    setAttachmentErrors((current) =>
+      current.filter((_uploadError, currentIndex) => currentIndex !== index),
+    );
+  }
+
+  function handleMessageKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
+  }
+
+  async function resumeActiveInterrupt(payload: ResumeInterruptPayload) {
+    const interruptId = state?.active_interrupt?.id;
+    if (
+      !threadId ||
+      !interruptId ||
+      isSubmitting ||
+      isResuming ||
+      state?.run.state === "running"
+    ) {
+      return;
+    }
+
+    const activeClarification =
+      payload.action === "answer" &&
+      state.active_interrupt?.type === "agent_clarification"
+        ? state.active_interrupt
+        : null;
+    const submittedClarification = activeClarification
+      ? {
+          interrupt_id: activeClarification.id,
+          question: diagnosticText(activeClarification.question),
+          reason: diagnosticText(activeClarification.reason),
+          answer:
+            payload.action === "answer"
+              ? payload.answer === AGENT_DECIDE_ANSWER
+                ? "Let the agent decide."
+                : payload.answer.trim()
+              : "",
+        }
+      : null;
+    if (submittedClarification?.answer) {
+      setSubmittedClarifications((current) => ({
+        ...current,
+        [submittedClarification.interrupt_id]: submittedClarification,
+      }));
+    }
+    setIsResuming(true);
+    try {
+      const nextState = await apiClient.resumeInterrupt(
+        threadId,
+        interruptId,
+        payload,
+      );
+      applyThreadState(nextState);
+      setError(null);
+    } catch (resumeError) {
+      if (submittedClarification) {
+        setSubmittedClarifications((current) => {
+          const { [submittedClarification.interrupt_id]: _removed, ...pending } = current;
+          return pending;
+        });
+      }
+      await handleRequestError(resumeError, threadId);
+    } finally {
+      setIsResuming(false);
+    }
+  }
+
+  function newConversation() {
+    if (isBusy) {
+      return;
+    }
+
+    createThreadPromiseRef.current = null;
+    pollGenerationRef.current += 1;
+    setThreadId(null);
+    setState(null);
+    setMessage("");
+    setPendingUserMessage(null);
+    setError(null);
+    setRunFailureMessage(null);
+    setStagedAttachments([]);
+    setAttachmentErrors([]);
+    setIsUploadingAttachments(false);
+    setSubmittedClarifications({});
+    setIsModelLockHintVisible(false);
+  }
+
+  const activeInterrupt = state?.active_interrupt;
+  const activeClarificationWasSubmitted = Boolean(
+    activeInterrupt && submittedClarifications[activeInterrupt.id],
+  );
+  const pendingDatasetReviewId =
+    activeInterrupt?.type === "dataset_review"
+      ? activeInterrupt.artifact.id
+      : null;
+  const isRunInFlight = state?.run.state === "running";
+  const hasUnprojectableInterrupt =
+    state?.run.error_code === "INTERRUPT_PROJECTION_FAILED";
+  const isAwaitingHumanReview =
+    Boolean(activeInterrupt) || hasUnprojectableInterrupt;
+  const isBusy =
+    isSubmitting ||
+    isResuming ||
+    isUploadingAttachments ||
+    isRunInFlight;
+  const isComposerDisabled =
+    !runtimeOptions || isBusy || isAwaitingHumanReview;
+  const isSendDisabled =
+    isComposerDisabled ||
+    (!message.trim() && stagedAttachments.length === 0) ||
+    attachmentErrors.length > 0;
+  const showInitialChatPrompt = !(state?.conversation.length);
+  const modelLocked = Boolean(state?.runtime_settings_locked);
+  const selectedModel = runtimeOptions?.models.find(
+    (model) => model.id === selectedRuntimeSettings.model_name,
+  );
+  const selectedModelLabel =
+    selectedModel?.label ?? selectedRuntimeSettings.model_name;
+  const settingsLocked = Boolean(modelLocked || isBusy);
+  const workflowStatus = activityStatusText(state);
+  const activityTitle = isSubmitting
+    ? "Submitting your message"
+    : isResuming
+      ? "Sending your review decision"
+      : isUploadingAttachments
+        ? "Uploading your files"
+        : isRunInFlight
+          ? "Agent is working"
+          : "";
+  const activityDetail = isRunInFlight
+    ? workflowStatus || "Running the workflow and checking for the next result."
+    : isSubmitting
+      ? "Creating or updating the thread, then handing your message to the backend."
+      : isResuming
+        ? "Resuming the workflow from the review panel."
+        : isUploadingAttachments
+          ? "Staging files for this message."
+          : "";
+  const chatDisabledReason = hasUnprojectableInterrupt
+    ? "This workflow is paused because its pending review could not be displayed."
+    : isAwaitingHumanReview
+      ? "Complete the review above before sending a new message."
+    : isBusy
+      ? "Wait for the current action to finish before sending another message."
+      : "";
+  const conversationMessages = pendingDatasetReviewId
+    ? (state?.conversation ?? []).filter(
+        (conversationMessage) =>
+          !isDatasetReviewCompletionMessage(
+            conversationMessage,
+            pendingDatasetReviewId,
+          ),
+      )
+    : (state?.conversation ?? []);
+  const shouldRenderPendingUser =
+    pendingUserMessage &&
+    !conversationMessages.some(
+      (conversationMessage) =>
+        isPendingMessageAcknowledged(
+          conversationMessage,
+          pendingUserMessage,
+        ),
+    );
+  const visibleConversationMessages = shouldRenderPendingUser
+    ? [...conversationMessages, pendingUserMessage]
+    : conversationMessages;
+  const hasVisibleConversation = visibleConversationMessages.length > 0;
+
+  function renderActiveInterrupt(interrupt: ActiveInterrupt) {
+    if (!threadId) {
+      return null;
+    }
+    switch (interrupt.type) {
+      case "dataset_plan_review":
+        return (
+          <DbRagReview
+            disabled={isBusy}
+            interrupt={interrupt}
+            onDecision={resumeActiveInterrupt}
+          />
+        );
+      case "dataset_review":
+        return (
+          <DbRagDatasetReview
+            apiClient={apiClient}
+            disabled={isBusy}
+            interrupt={interrupt}
+            onResume={resumeActiveInterrupt}
+            threadId={threadId}
+          />
+        );
+      case "analysis_result_review":
+        return (
+          <AnalysisResultReview
+            apiClient={apiClient}
+            disabled={isBusy}
+            interrupt={interrupt}
+            onResume={resumeActiveInterrupt}
+            threadId={threadId}
+          />
+        );
+      case "agent_clarification":
+        return activeClarificationWasSubmitted ? null : (
+          <Clarification
+            disabled={isBusy}
+            interrupt={interrupt}
+            onResume={resumeActiveInterrupt}
+          />
+        );
+      case "model_output_limit":
+        return (
+          <ModelOutputLimit
+            disabled={isBusy}
+            interrupt={interrupt}
+            onResume={resumeActiveInterrupt}
+          />
+        );
+      default:
+        return assertNever(interrupt);
+    }
+  }
+
+  return (
+    <AppShell
+      sidebar={
+        <div className="settings-panel">
+          <ConversationHistory
+            activeThreadId={threadId}
+            actionsDisabled={isBusy}
+            items={savedConversations}
+            onArchive={archiveConversation}
+            onDelete={deleteConversation}
+            onNewConversation={newConversation}
+            onOpen={openConversation}
+            onRename={renameConversation}
+            onRestore={restoreConversation}
+          />
+        </div>
+      }
+      conversation={
+        <>
+          {error ? (
+            <div className="error-banner" role="alert">
+              {error}
+            </div>
+          ) : null}
+          {runFailureMessage ? (
+            <div className="run-failure-card" role="alert">
+              {runFailureMessage}
+            </div>
+          ) : null}
+
+          <section
+            className="conversation-panel"
+            aria-label="Conversation messages"
+          >
+            {hasVisibleConversation || activityTitle ? (
+              <ol className="message-list" aria-label="Conversation messages">
+                {visibleConversationMessages.map((conversationMessage) => (
+                  <ConversationMessage
+                    attachmentUrl={(attachmentId) =>
+                      threadId
+                        ? apiClient.conversationAttachmentUrl(
+                            threadId,
+                            attachmentId,
+                          )
+                        : ""
+                    }
+                    getDatasetPreview={(attachmentId, limit) => {
+                      if (!threadId) {
+                        return Promise.reject(
+                          new Error("Thread is unavailable."),
+                        );
+                      }
+                      return apiClient.getDatasetPreview(
+                        threadId,
+                        attachmentId,
+                        limit,
+                      );
+                    }}
+                    getDatasetSchema={(attachmentId) => {
+                      if (!threadId) {
+                        return Promise.reject(
+                          new Error("Thread is unavailable."),
+                        );
+                      }
+                      return apiClient.getDatasetSchema(
+                        threadId,
+                        attachmentId,
+                      );
+                    }}
+                    getDatasetProvenance={(attachmentId) => {
+                      if (!threadId) {
+                        return Promise.reject(
+                          new Error("Thread is unavailable."),
+                        );
+                      }
+                      return apiClient.getDatasetProvenance(
+                        threadId,
+                        attachmentId,
+                      );
+                    }}
+                    getAnalysisResult={(attachmentId) => {
+                      if (!threadId) {
+                        return Promise.reject(
+                          new Error("Thread is unavailable."),
+                        );
+                      }
+                      return apiClient.getAnalysisResult(threadId, attachmentId);
+                    }}
+                    key={conversationMessage.id}
+                    message={conversationMessage}
+                  />
+                ))}
+                {activityTitle ? (
+                  <ActivityMessage
+                    detail={activityDetail}
+                    steps={state?.run.steps}
+                    title={activityTitle}
+                  />
+                ) : null}
+              </ol>
+            ) : null}
+          </section>
+
+          {activeInterrupt ? renderActiveInterrupt(activeInterrupt) : null}
+          {optimisticClarifications.length ? (
+            <ClarificationTrace exchanges={optimisticClarifications} />
+          ) : null}
+        </>
+      }
+      input={
+        <>
+          <form className="message-form" onSubmit={submitMessage}>
+            {showInitialChatPrompt && !hasVisibleConversation ? (
+              <label htmlFor="message-input">
+                Ask questions about your data or query from existing database
+              </label>
+            ) : null}
+            {chatDisabledReason ? (
+              <p className="message-form-note">{chatDisabledReason}</p>
+            ) : null}
+            <textarea
+              aria-label="Ask a question about your dataset!"
+              disabled={isComposerDisabled}
+              id="message-input"
+              onChange={(event) => setMessage(event.target.value)}
+              onKeyDown={handleMessageKeyDown}
+              placeholder={
+                isAwaitingHumanReview
+                  ? "Complete the review above before continuing."
+                  : hasVisibleConversation
+                    ? undefined
+                    : "e.g. Create a baseline index-case dataset with age, sex, marital status, smoking, alcohol use, and diabetes medication use. Give me a simple summary table."
+              }
+              rows={4}
+              value={message}
+            />
+            <AttachmentComposer
+              action={
+                <>
+                  {modelLocked ? (
+                    <div className="composer-locked-model">
+                      <button
+                        aria-controls="model-lock-hint"
+                        aria-describedby={
+                          isModelLockHintVisible ? "model-lock-hint" : undefined
+                        }
+                        aria-label={`Model locked: ${selectedModelLabel}`}
+                        className="composer-locked-model-button"
+                        onBlur={() => setIsModelLockHintVisible(false)}
+                        onFocus={() => setIsModelLockHintVisible(true)}
+                        onMouseEnter={() => setIsModelLockHintVisible(true)}
+                        onMouseLeave={() => setIsModelLockHintVisible(false)}
+                        type="button"
+                      >
+                        <span aria-hidden="true">🔒</span>
+                        {selectedModelLabel}
+                      </button>
+                      {isModelLockHintVisible ? (
+                        <p
+                          className="composer-model-lock-popover"
+                          id="model-lock-hint"
+                          role="tooltip"
+                        >
+                          Model locked for this conversation. Start a new conversation to choose a different model.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <select
+                      aria-label="Model"
+                      className="composer-model-picker"
+                      disabled={settingsLocked || !runtimeOptions}
+                      onChange={(event) =>
+                        setSelectedRuntimeSettings((current) => ({
+                          ...current,
+                          model_name: event.target.value,
+                        }))
+                      }
+                      value={selectedRuntimeSettings.model_name}
+                    >
+                      {runtimeOptions?.models.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <button disabled={isSendDisabled} type="submit">Send</button>
+                </>
+              }
+              disabled={isComposerDisabled}
+              errors={attachmentErrors}
+              isUploading={isUploadingAttachments}
+              leadingAction={
+                <button
+                  className="new-conversation-button"
+                  disabled={isBusy}
+                  onClick={newConversation}
+                  type="button"
+                >
+                  New conversation
+                </button>
+              }
+              onDismissError={dismissAttachmentError}
+              onFilesSelected={selectAttachments}
+              onRemove={removeStagedAttachment}
+              staged={stagedAttachments}
+            />
+          </form>
+        </>
+      }
+    />
+  );
+}

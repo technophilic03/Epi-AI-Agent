@@ -1,0 +1,142 @@
+import type { RuntimeOptions, RuntimeSettings } from "./types";
+
+interface Props {
+  locked: boolean;
+  onChange(settings: RuntimeSettings): void;
+  options: RuntimeOptions | null;
+  settings: RuntimeSettings;
+}
+
+const numericFields = {
+  temperature: "Temperature",
+  top_p: "Top probability",
+  max_steps: "Auto-run steps",
+  timeout_seconds: "Workflow timeout",
+} as const satisfies Record<
+  "temperature" | "top_p" | "max_steps" | "timeout_seconds",
+  string
+>;
+
+type NumericField = keyof typeof numericFields;
+
+function capabilityLabel(status: "available" | "not_configured") {
+  return status === "available" ? "Available" : "Not configured";
+}
+
+function numericValue(value: number | null) {
+  return value ?? "";
+}
+
+export default function RuntimeSettingsPanel({
+  locked,
+  onChange,
+  options,
+  settings,
+}: Props) {
+  const modelOptions = options?.models ?? [];
+  const modelValue = modelOptions.some(
+    (model) => model.id === settings.model_name,
+  )
+    ? settings.model_name
+    : "";
+  const controlsDisabled = locked;
+
+  function updateSettings(update: Partial<RuntimeSettings>) {
+    onChange({ ...settings, ...update });
+  }
+
+  function handleNumberChange(field: NumericField, value: string) {
+    if (value === "") {
+      updateSettings({ [field]: null });
+      return;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+    if (field === "max_steps" && !Number.isInteger(parsed)) {
+      return;
+    }
+
+    updateSettings({ [field]: parsed });
+  }
+
+  return (
+    <section className="runtime-settings-panel" aria-labelledby="runtime-settings-title">
+      <h2 id="runtime-settings-title">Model Settings</h2>
+      {locked ? (
+        <p className="runtime-settings-lock">Settings are locked for this thread.</p>
+      ) : null}
+
+      <label>
+        <span>Model</span>
+        <select
+          disabled={controlsDisabled || modelOptions.length === 0}
+          onChange={(event) => updateSettings({ model_name: event.target.value })}
+          value={modelValue}
+        >
+          <option disabled value="">
+            Select model
+          </option>
+          {modelOptions.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      {Object.entries(numericFields).map(([field, label]) => (
+        <label key={field}>
+          <span>{label}</span>
+          <input
+            disabled={controlsDisabled}
+            onChange={(event) =>
+              handleNumberChange(field as NumericField, event.target.value)
+            }
+            inputMode={field === "max_steps" ? "numeric" : "decimal"}
+            type="text"
+            value={numericValue(settings[field as NumericField])}
+          />
+        </label>
+      ))}
+
+      <dl className="settings-list">
+        {options ? (
+          <>
+            <div>
+              <dt>Publication knowledge</dt>
+              <dd>
+                {`Publication knowledge: ${capabilityLabel(
+                  options.capabilities.publication_knowledge.status,
+                )}`}
+              </dd>
+            </div>
+            <div>
+              <dt>DB-RAG dataset</dt>
+              <dd>
+                {`DB-RAG dataset: ${capabilityLabel(
+                  options.capabilities.db_rag_dataset.status,
+                )}`}
+                {options.capabilities.db_rag_dataset.status ===
+                  "not_configured" &&
+                options.capabilities.db_rag_dataset.message ? (
+                  <small>{options.capabilities.db_rag_dataset.message}</small>
+                ) : null}
+              </dd>
+            </div>
+          </>
+        ) : null}
+        <div>
+          <dt>Embedding model</dt>
+          <dd>{settings.db_rag_embedding_model || "Unavailable"}</dd>
+        </div>
+        <div>
+          <dt>Reranker model</dt>
+          <dd>{settings.db_rag_reranker_model || "Unavailable"}</dd>
+        </div>
+      </dl>
+    </section>
+  );
+}

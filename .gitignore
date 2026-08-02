@@ -1,0 +1,51 @@
+# Secrets and local environments.
+.env
+.streamlit/secrets.toml
+.venv/
+.venv-*/
+
+# Dependency directories and generated caches.
+node_modules/
+frontend/node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.uv-cache/
+.DS_Store
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Local-only development and generated content.
+scripts/
+tests/
+runtime/
+study_design/
+
+# Local tools and scratch work.
+.worktrees/
+.superpowers/
+.github/
+AGENTS.md
+docs/
+run_fastapi_typescript_app.py
+slides/
+tmp/
+benchmark_app/
+todo.md
+
+# Raw/private source data and user-generated artifacts.
+local_data/
+data/
+synthetic_report_india/
+runtime/*
+!runtime/.gitkeep
+study_data/
+
+# Study package contents belong in local study storage, not this generic agent.
+publication/
+
+# Private validation and generated benchmark material.
+docs/validation_prep/
+db_rag/benchmark/
+runtime/datasets/

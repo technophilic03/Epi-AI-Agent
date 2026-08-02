@@ -1,0 +1,3930 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+from db_rag.filter_references import (
+    FilterReferenceResolutionError,
+    resolve_filter_references,
+)
+from db_rag.service.dataset_naming import deterministic_dataset_name
+from db_rag.service.models import (
+    PreparedSqlCandidate,
+    SqlExecutionResult,
+    ValidatedExtractionSql,
+)
+from db_rag.service.sql_service import (
+    execute_validated_extraction_sql,
+    validate_extraction_sql,
+)
+from epi_agent.artifacts import DatasetPlan, PlanField
+from epi_agent.db_rag import persistence as db_rag_persistence
+from epi_agent.db_rag.sql_compiler import compile_dataset_plan_sql
+from epi_agent.db_rag.quality import inspect_dataset as inspect_dataset_artifact
+from epi_agent.db_rag.reviews import (
+    RequestDatasetPlanReviewTool,
+    RequestDatasetReviewTool,
+)
+from epi_agent.protocol import (
+    AgentTool,
+    ArtifactRef,
+    ArtifactStore,
+    ToolContext,
+    ToolExecutionError,
+    ToolResult,
+    ToolSpec,
+    require_context_study,
+)
+from epi_agent.registry import ToolRegistry
+from epi_agent.studies import StudySourceUnavailableError
+from utils.dataset_artifacts import (
+    cleanup_dataset_staging,
+    generated_dataset_artifact_paths,
+    generated_dataset_staging_paths,
+    load_verified_dataset_artifact,
+    load_dataset_persistence_journal,
+    promote_staged_dataset_artifact,
+    verify_dataset_artifact_manifest,
+    write_dataset_persistence_journal,
+)
+
+
+_MAX_SEARCH_HITS = 10
+_MAX_CATALOG_QUERIES = 5
+_MAX_CATALOG_HITS = 25
+_MAX_TABLE_FIELDS = 25
+_MAX_EXCERPT_CHARS = 500
+_MAX_OPEN_CHARS = 4_000
+_DBRAG_TOOL_PREFIX = "dbrag-"
+_DATASET_KINDS = {
+    "analysis_dataset",
+    "dataset",
+    "db_rag_result",
+    "subset",
+    "uploaded",
+}
+
+_PLAN_REPAIR_HINTS = {
+    "PLAN_SOURCE_UNAVAILABLE": "Use a runtime source returned by schema discovery.",
+    "PLAN_FIELD_UNAVAILABLE": "Replace the field with an available table and column from the runtime catalog.",
+    "PLAN_OUTPUT_NAME_CONFLICT": "Give fields from different source columns unique output_column aliases.",
+    "PLAN_FILTER_CANONICAL_REQUIRED": "Add the required filter description and canonical predicate or value_constraints.",
+    "PLAN_OPERATION_INVALID": "Reference only structured fields already present in the plan or its runtime operations.",
+    "PLAN_RELATIONSHIP_UNPROVEN": "Use an exact relationship profile and matching join key pairs.",
+    "PLAN_JOIN_KEY_MISSING": "Replace the join key with an available column from the selected table.",
+    "PLAN_TABLE_GRAPH_DISCONNECTED": "Add the missing evidence-backed join operation or remove the disconnected table.",
+    "PLAN_REDUCTION_FIELD_UNAVAILABLE": "Use an available field from the reduction table.",
+    "PLAN_REDUCTION_REFERENCE_INVALID": "Keep reduction fields in the declared reduction source table.",
+    "PLAN_REDUCTION_FILTER_INVALID": "Use an available field from the reduced table in the reduction filter.",
+}
+
+
+def _dbrag_tool_name(operation: str) -> str:
+    return f"{_DBRAG_TOOL_PREFIX}{operation}"
+
+
+class OpenArtifactArguments(BaseModel):
+    artifact_id: str
+    version: int = Field(ge=1)
+
+
+class CatalogSearchArguments(BaseModel):
+    queries: list[str] = Field(
+        min_length=1,
+        max_length=_MAX_CATALOG_QUERIES,
+        description=(
+            "Independent semantic schema probes to execute together. Include all "
+            "currently needed concepts in one call."
+        ),
+    )
+    limit: int = Field(
+        default=5,
+        ge=1,
+        le=_MAX_SEARCH_HITS,
+        description="Maximum catalog hits returned for each semantic probe.",
+    )
+
+    @field_validator("queries")
+    @classmethod
+    def normalize_queries(cls, value: list[str]) -> list[str]:
+        normalized = [query.strip() for query in value]
+        if any(not query for query in normalized):
+            raise ValueError("Catalog semantic probes cannot be empty.")
+        return normalized
+
+
+class InspectTableArguments(BaseModel):
+    source: str = Field(
+        description="Exact runtime source ID returned by dbrag-search_catalog."
+    )
+    table: str
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=_MAX_TABLE_FIELDS, ge=1, le=_MAX_TABLE_FIELDS)
+
+
+class RequiredFieldArguments(BaseModel):
+    source: str = Field(
+        description="Exact runtime source ID returned by dbrag-search_catalog."
+    )
+    table: str
+    column: str
+
+
+class FindJoinPathsArguments(BaseModel):
+    required_fields: list[RequiredFieldArguments] = Field(min_length=2)
+    max_hops: int = Field(default=3, ge=1, le=5)
+    max_paths: int = Field(default=10, ge=1, le=20)
+
+
+class RelationshipKeyPairArguments(BaseModel):
+    left_column: str
+    right_column: str
+
+
+class ProfileRelationshipArguments(BaseModel):
+    source: str = Field(
+        description="Exact runtime source ID returned by dbrag-search_catalog."
+    )
+    left_table: str
+    right_table: str
+    key_pairs: list[RelationshipKeyPairArguments] = Field(min_length=1)
+
+
+class SaveDatasetPlanArguments(BaseModel):
+    plan: DatasetPlan
+    prior_id: str | None = None
+    prior_version: int | None = Field(default=None, ge=1)
+
+
+class ValidateDatasetPlanArguments(BaseModel):
+    plan_id: str
+    plan_version: int = Field(ge=1)
+
+
+class ValidateAndExtractArguments(BaseModel):
+    plan_id: str
+    plan_version: int = Field(ge=1)
+    sql: str | None = None
+    predecessor_dataset_id: str | None = None
+    predecessor_dataset_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_replacement_pair(self) -> "ValidateAndExtractArguments":
+        if (self.predecessor_dataset_id is None) != (
+            self.predecessor_dataset_version is None
+        ):
+            raise ValueError(
+                "predecessor_dataset_id and predecessor_dataset_version "
+                "must be supplied together"
+            )
+        if self.sql is not None and not self.sql.strip():
+            raise ValueError("sql must not be blank when supplied")
+        return self
+
+
+class InspectDatasetArguments(BaseModel):
+    dataset_id: str
+    dataset_version: int = Field(ge=1)
+    plan_id: str
+    plan_version: int = Field(ge=1)
+
+
+@dataclass(frozen=True)
+class _FunctionTool:
+    spec: ToolSpec
+    handler: Callable[[dict[str, Any], ToolContext], ToolResult]
+
+    def invoke(
+        self,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        return self.handler(arguments, context)
+
+
+def _store(context: ToolContext) -> ArtifactStore:
+    store = context.artifact_store
+    required_methods = (
+        "require",
+        "save_artifact",
+        "save_dataset_plan",
+        "transition_artifact_status",
+        "snapshot",
+    )
+    if not all(callable(getattr(store, method, None)) for method in required_methods):
+        raise ToolExecutionError(
+            "ARTIFACT_STORE_UNAVAILABLE",
+            "The DB-RAG artifact store is unavailable.",
+            recoverable=False,
+        )
+    return store
+
+
+def _save_observation(
+    context: ToolContext,
+    *,
+    kind: str,
+    content: dict[str, Any],
+    producer: str,
+    summary: str,
+) -> ArtifactRef:
+    return _store(context).save_artifact(
+        kind=kind,
+        content=content,
+        provenance={
+            "study_id": require_context_study(context).study_id,
+            "thread_id": context.thread_id,
+            "producer": producer,
+        },
+        summary=summary,
+    )
+
+
+def _bounded_model_dump(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        row = value.model_dump(mode="json")
+    elif isinstance(value, dict):
+        row = dict(value)
+    else:
+        raise TypeError(f"Unsupported provider result: {type(value).__name__}")
+    if "text" in row:
+        row["text"] = str(row["text"])[:_MAX_EXCERPT_CHARS]
+    return row
+
+
+def _safe_schema_provenance(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = (
+        "authority",
+        "source_id",
+        "source_kind",
+        "path",
+        "table",
+        "column",
+        "form",
+        "collection",
+        "index_name",
+        "chunk_id",
+    )
+    return {
+        key: _bounded_text(value.get(key), limit=300)
+        for key in allowed
+        if value.get(key) is not None
+    }
+
+
+def _schema_evidence_hit(value: Any) -> dict[str, Any]:
+    table = _bounded_text(_provider_field(value, "table"), limit=300)
+    column = _bounded_text(_provider_field(value, "column"), limit=300)
+    provenance = _safe_schema_provenance(
+        _provider_field(value, "provenance")
+    ) or {
+        "authority": "runtime_schema_catalog",
+        "table": table,
+        **({"column": column} if column else {}),
+    }
+    source = (
+        _bounded_text(_provider_field(value, "source"), limit=300)
+        or _bounded_text(provenance.get("source_id"), limit=300)
+    )
+    return {
+        **({"source": source} if source else {}),
+        "table": table,
+        **({"column": column} if column else {}),
+        "text": _bounded_text(_provider_field(value, "text")),
+        "source_kind": (
+            _bounded_text(_provider_field(value, "source_kind"), limit=100)
+            or "schema"
+        ),
+        "provenance": provenance,
+    }
+
+
+def _provider_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _bounded_text(value: Any, *, limit: int = _MAX_EXCERPT_CHARS) -> str:
+    if not isinstance(value, (str, int, float, bool)):
+        return ""
+    return str(value or "")[:limit]
+
+
+def _collection(content: dict[str, Any], key: str) -> list[Any]:
+    value = content.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list")
+    return value
+
+
+def _safe_string_list(value: Any, *, limit: int = 50) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        _bounded_text(item, limit=200)
+        for item in value[:limit]
+        if isinstance(item, str)
+    ]
+
+
+def _safe_numeric_mapping(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        _bounded_text(key, limit=200): float(item)
+        for key, item in value.items()
+        if isinstance(key, str)
+        and isinstance(item, (int, float))
+        and not isinstance(item, bool)
+    }
+
+
+def _safe_boolean_mapping(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        _bounded_text(key, limit=200): item
+        for key, item in value.items()
+        if isinstance(key, str) and isinstance(item, bool)
+    }
+
+
+def _safe_field(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    field = {
+        key: _bounded_text(value.get(key), limit=300)
+        for key in (
+            "source",
+            "table",
+            "column",
+            "output_column",
+            "purpose",
+            "aggregation",
+            "description",
+            "usage",
+            "semantic",
+            "dataType",
+            "notes",
+            "text",
+            "source_kind",
+            "retrieval_probe",
+        )
+        if value.get(key) is not None
+    }
+    provenance = _safe_schema_provenance(value.get("provenance"))
+    if provenance:
+        field["provenance"] = provenance
+    return field
+
+
+def _safe_key_pairs(value: Any) -> list[list[str]]:
+    if not isinstance(value, list):
+        return []
+    pairs: list[list[str]] = []
+    for pair in value[:20]:
+        if isinstance(pair, dict):
+            left = _bounded_text(pair.get("left_column"), limit=200)
+            right = _bounded_text(pair.get("right_column"), limit=200)
+        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+            left = _bounded_text(pair[0], limit=200)
+            right = _bounded_text(pair[1], limit=200)
+        else:
+            continue
+        if left and right:
+            pairs.append([left, right])
+    return pairs
+
+
+def _safe_relationship_profile(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    profile: dict[str, Any] = {}
+    for key in ("left_table", "right_table", "left_cardinality", "right_cardinality"):
+        if value.get(key) is not None:
+            profile[key] = _bounded_text(value.get(key), limit=200)
+    for key in (
+        "left_distinct_keys",
+        "right_distinct_keys",
+        "matched_keys",
+        "joined_rows",
+    ):
+        if isinstance(value.get(key), int):
+            profile[key] = value[key]
+    profile["key_pairs"] = _safe_key_pairs(_collection(value, "key_pairs"))
+    profile["warnings"] = _safe_string_list(
+        _collection(value, "warnings"),
+        limit=20,
+    )
+    return profile
+
+
+def _render_dataset_plan(content: dict[str, Any]) -> dict[str, Any]:
+    concepts: list[dict[str, Any]] = []
+    for concept in _collection(content, "concepts"):
+        if not isinstance(concept, dict):
+            continue
+        safe_concept = {
+            key: _bounded_text(concept.get(key), limit=500)
+            for key in ("concept_id", "id", "label", "retrieval_probe")
+            if concept.get(key) is not None
+        }
+        safe_concept["fields"] = [
+            field
+            for field in (
+                _safe_field(item) for item in _collection(concept, "fields")
+            )
+            if field
+        ][:50]
+        concepts.append(safe_concept)
+
+    operations: list[dict[str, Any]] = []
+    for operation in _collection(content, "operations"):
+        if not isinstance(operation, dict):
+            continue
+        safe_operation = {
+            key: _bounded_text(operation.get(key), limit=500)
+            for key in (
+                "name",
+                "type",
+                "description",
+                "source",
+                "left_table",
+                "right_table",
+                "relationship_artifact_id",
+            )
+            if operation.get(key) is not None
+        }
+        if isinstance(operation.get("relationship_artifact_version"), int):
+            safe_operation["relationship_artifact_version"] = operation[
+                "relationship_artifact_version"
+            ]
+        safe_operation["key_pairs"] = _safe_key_pairs(
+            _collection(operation, "key_pairs")
+        )
+        safe_operation["field_refs"] = [
+            field
+            for field in (
+                _safe_field(item)
+                for item in _collection(operation, "field_refs")
+            )
+            if field
+        ][:50]
+        operations.append(safe_operation)
+
+    return {
+        "goal": _bounded_text(content.get("goal"), limit=1_000),
+        "row_definition": _bounded_text(
+            content.get("row_definition"),
+            limit=1_000,
+        ),
+        "concepts": concepts[:50],
+        "required_fields": [
+            field
+            for field in (
+                _safe_field(item)
+                for item in _collection(content, "required_fields")
+            )
+            if field
+        ][:100],
+        "operations": operations[:50],
+        "filter_count": len(_collection(content, "filters")),
+        "unresolved_count": len(_collection(content, "unresolved")),
+    }
+
+
+def _render_evidence(content: dict[str, Any]) -> dict[str, Any]:
+    collection_key = "sections" if "sections" in content else "hits"
+    hits: list[dict[str, Any]] = []
+    for hit in _collection(content, collection_key):
+        if not isinstance(hit, dict):
+            continue
+        hits.append(
+            {
+                key: _bounded_text(hit.get(key))
+                for key in (
+                    "source_id",
+                    "source_kind",
+                    "title",
+                    "section",
+                    "text",
+                    "excerpt",
+                )
+                if hit.get(key) is not None
+            }
+        )
+    rendered = {collection_key: hits[:_MAX_SEARCH_HITS]}
+    if content.get("query") is not None:
+        rendered["query"] = _bounded_text(content.get("query"))
+    if content.get("source_id") is not None:
+        rendered["source_id"] = _bounded_text(content.get("source_id"))
+    return rendered
+
+
+def _render_catalog(content: dict[str, Any]) -> dict[str, Any]:
+    collection_key = "hits" if "hits" in content else "fields"
+    item_limit = (
+        _MAX_CATALOG_HITS
+        if collection_key == "hits"
+        else _MAX_TABLE_FIELDS
+    )
+    hits = [
+        field
+        for field in (
+            _safe_field(item)
+            for item in _collection(content, collection_key)
+        )
+        if field
+    ][:item_limit]
+    return {
+        key: value
+        for key, value in {
+            "query": _bounded_text(content.get("query")),
+            "queries": _safe_string_list(
+                _collection(content, "queries"),
+                limit=_MAX_CATALOG_QUERIES,
+            ),
+            "source": _bounded_text(content.get("source")),
+            "source_ids": _safe_string_list(
+                _collection(content, "source_ids"),
+                limit=50,
+            ),
+            "table": _bounded_text(content.get("table")),
+            "offset": content.get("offset"),
+            "next_offset": content.get("next_offset"),
+            collection_key: hits,
+        }.items()
+        if value not in ("", [], None)
+    }
+
+
+def _render_relationship(content: dict[str, Any]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {"source": _bounded_text(content.get("source"))}
+    profile = _safe_relationship_profile(content.get("profile"))
+    if profile:
+        rendered["profile"] = profile
+    required_fields = [
+        field
+        for field in (
+            _safe_field(item)
+            for item in _collection(content, "required_fields")
+        )
+        if field
+    ]
+    if required_fields:
+        rendered["required_fields"] = required_fields[:50]
+    paths: list[dict[str, Any]] = []
+    for path in _collection(content, "paths"):
+        if not isinstance(path, dict):
+            continue
+        paths.append(
+            {
+                "tables": _safe_string_list(
+                    _collection(path, "tables"),
+                    limit=10,
+                ),
+                "profiles": [
+                    safe_profile
+                    for safe_profile in (
+                        _safe_relationship_profile(item)
+                        for item in _collection(path, "profiles")
+                    )
+                    if safe_profile
+                ][:10],
+            }
+        )
+    if paths:
+        rendered["paths"] = paths[:20]
+    return rendered
+
+
+def _render_quality(content: dict[str, Any]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {
+        "dataset_id": _bounded_text(content.get("dataset_id"), limit=200),
+        "plan_id": _bounded_text(content.get("plan_id"), limit=200),
+        "sql_id": _bounded_text(content.get("sql_id"), limit=200),
+    }
+    for key in (
+        "dataset_version",
+        "plan_version",
+        "sql_version",
+        "row_count",
+        "column_count",
+        "duplicate_grain_rows",
+    ):
+        value = content.get(key)
+        rendered[key] = value if isinstance(value, int) else None
+    rendered["null_rates"] = _safe_numeric_mapping(content.get("null_rates"))
+    rendered["requested_concept_coverage"] = _safe_boolean_mapping(
+        content.get("requested_concept_coverage")
+    )
+    rendered["join_expansion"] = _safe_numeric_mapping(
+        content.get("join_expansion")
+    )
+    grain_uniqueness = content.get("grain_uniqueness")
+    if isinstance(grain_uniqueness, dict):
+        rendered["grain_uniqueness"] = {
+            "columns": _safe_string_list(
+                _collection(grain_uniqueness, "columns"),
+                limit=20,
+            ),
+            "row_count": grain_uniqueness.get("row_count"),
+            "distinct_key_count": grain_uniqueness.get("distinct_key_count"),
+            "duplicate_rows": grain_uniqueness.get("duplicate_rows"),
+            "is_unique": grain_uniqueness.get("is_unique"),
+        }
+    else:
+        rendered["grain_uniqueness"] = None
+    rendered["relationship_metrics"] = [
+        {
+            "evidence_label": _bounded_text(
+                metric.get("evidence_label"),
+                limit=100,
+            ),
+            "relationship_artifact_id": _bounded_text(
+                metric.get("relationship_artifact_id"),
+                limit=200,
+            ),
+            "relationship_artifact_version": metric.get(
+                "relationship_artifact_version"
+            ),
+            **_safe_relationship_profile(metric),
+        }
+        for metric in _collection(content, "relationship_metrics")
+        if isinstance(metric, dict)
+    ][:20]
+    rendered["unexpected_columns"] = _safe_string_list(
+        _collection(content, "unexpected_columns"),
+        limit=100,
+    )
+    rendered["warnings"] = [
+        {
+            key: _bounded_text(warning.get(key), limit=500)
+            for key in ("code", "severity", "message")
+            if warning.get(key) is not None
+        }
+        for warning in _collection(content, "warnings")
+        if isinstance(warning, dict)
+    ][:50]
+    return rendered
+
+
+def _render_selection(content: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selection_id": _bounded_text(content.get("selection_id")),
+        "goal_text": _bounded_text(content.get("goal_text"), limit=1_000),
+        "tables": _safe_string_list(_collection(content, "tables"), limit=50),
+        "columns": [
+            field
+            for field in (
+                _safe_field(item) for item in _collection(content, "columns")
+            )
+            if field
+        ][:100],
+        "rationale": _bounded_text(content.get("rationale"), limit=1_000),
+        "status": _bounded_text(content.get("status"), limit=100),
+    }
+
+
+def _render_sql(content: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sql_candidate_id": _bounded_text(content.get("sql_candidate_id")),
+        "plan_id": _bounded_text(content.get("plan_id")),
+        "plan_version": (
+            content.get("plan_version")
+            if isinstance(content.get("plan_version"), int)
+            else None
+        ),
+        "selection_artifact_id": _bounded_text(
+            content.get("selection_artifact_id")
+        ),
+        "goal_text": _bounded_text(content.get("goal_text"), limit=1_000),
+        "tables": _safe_string_list(_collection(content, "tables"), limit=50),
+        "columns": [
+            field
+            for field in (
+                _safe_field(item) for item in _collection(content, "columns")
+            )
+            if field
+        ][:100],
+        "sql": _bounded_text(content.get("sql"), limit=3_000),
+        "status": _bounded_text(content.get("status"), limit=100),
+    }
+
+
+def _dataset_lineage(content: dict[str, Any]) -> dict[str, Any]:
+    provenance = content.get("provenance")
+    if not isinstance(provenance, dict):
+        return {}
+    lineage: dict[str, Any] = {}
+    for prefix in ("plan", "selection", "sql"):
+        artifact_id = provenance.get(f"{prefix}_id")
+        version = provenance.get(f"{prefix}_version")
+        if isinstance(artifact_id, str) and isinstance(version, int):
+            lineage[f"{prefix}_id"] = artifact_id
+            lineage[f"{prefix}_version"] = version
+    return lineage
+
+
+def _render_dataset(content: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _bounded_text(content.get("id"), limit=200),
+        "status": _bounded_text(content.get("status"), limit=100),
+        "row_count": content.get("row_count")
+        if isinstance(content.get("row_count"), int)
+        else None,
+        "column_count": content.get("column_count")
+        if isinstance(content.get("column_count"), int)
+        else None,
+        "columns": _safe_string_list(
+            _collection(content, "columns"),
+            limit=200,
+        ),
+        "lineage": _dataset_lineage(content),
+    }
+
+
+_ARTIFACT_RENDERERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "catalog_search": _render_catalog,
+    "dataset_plan": _render_dataset_plan,
+    "dataset_quality_report": _render_quality,
+    "db_rag_column_selection": _render_selection,
+    "db_rag_sql_candidate": _render_sql,
+    "validated_sql": _render_sql,
+    "relationship_profile": _render_relationship,
+    "study_evidence": _render_evidence,
+    "study_source": _render_evidence,
+    "table_profile": _render_catalog,
+}
+
+
+def _load_artifact(context: ToolContext, artifact_id: str) -> Any:
+    store = _store(context)
+    try:
+        artifact = store.require(artifact_id)
+    except KeyError as error:
+        snapshot = store.snapshot()
+        files = dict(snapshot.get("files") or {})
+        datasets = dict(snapshot.get("datasets") or {})
+        if artifact_id in files or artifact_id in datasets:
+            raise ToolExecutionError(
+                "ARTIFACT_STALE",
+                f"Artifact does not use the current envelope: {artifact_id}",
+                recoverable=True,
+            ) from error
+        raise ToolExecutionError(
+            "ARTIFACT_NOT_FOUND",
+            f"Artifact is unavailable: {artifact_id}",
+            recoverable=True,
+        ) from error
+    except ValidationError as error:
+        raise ToolExecutionError(
+            "ARTIFACT_STALE",
+            f"Artifact does not use the current envelope: {artifact_id}",
+            recoverable=True,
+        ) from error
+    for attribute in ("id", "kind", "version", "status", "content", "provenance"):
+        if not hasattr(artifact, attribute):
+            raise ToolExecutionError(
+                "ARTIFACT_STALE",
+                f"Artifact does not use the current envelope: {artifact_id}",
+                recoverable=True,
+            )
+    return artifact
+
+
+def _require_artifact(
+    context: ToolContext,
+    *,
+    artifact_id: str,
+    version: int,
+    kind: str | None = None,
+) -> Any:
+    artifact = _load_artifact(context, artifact_id)
+    if artifact.version != version or (kind is not None and artifact.kind != kind):
+        raise ToolExecutionError(
+            "ARTIFACT_STALE",
+            f"Artifact version or kind is stale: {artifact_id}",
+            recoverable=True,
+        )
+    return artifact
+
+
+def _require_source(context: ToolContext, source_name: str) -> Any:
+    try:
+        return require_context_study(context).data_sources[source_name]
+    except KeyError as error:
+        raise ToolExecutionError(
+            "SOURCE_UNAVAILABLE",
+            f"Runtime source is unavailable: {source_name}",
+            recoverable=True,
+        ) from error
+
+
+def _relationship_inventory(context: ToolContext, source_name: str) -> Any:
+    source = _require_source(context, source_name)
+    factory = getattr(source, "relationship_inventory", None)
+    if not callable(factory):
+        raise ToolExecutionError(
+            "RELATIONSHIP_PROVIDER_UNAVAILABLE",
+            f"Source does not provide relationship inspection: {source_name}",
+            recoverable=True,
+        )
+    try:
+        return factory()
+    except StudySourceUnavailableError as error:
+        raise ToolExecutionError(
+            "RELATIONSHIP_PROVIDER_UNAVAILABLE",
+            f"Relationship provider is unavailable for source {source_name}.",
+            recoverable=True,
+        ) from error
+    except (KeyError, ValueError) as error:
+        raise ToolExecutionError(
+            "RELATIONSHIP_UNAVAILABLE",
+            f"Relationship inventory is unavailable for source {source_name}.",
+            recoverable=True,
+        ) from error
+
+
+def _open_artifact(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+    artifact_id = arguments["artifact_id"]
+    artifact = _require_artifact(
+        context,
+        artifact_id=artifact_id,
+        version=arguments["version"],
+    )
+    if artifact.kind in _DATASET_KINDS:
+        renderer = _render_dataset
+    else:
+        renderer = _ARTIFACT_RENDERERS.get(artifact.kind)
+        if renderer is None:
+            raise ToolExecutionError(
+                "ARTIFACT_KIND_UNSAFE",
+                f"Artifact kind cannot be opened safely: {artifact.kind}",
+                recoverable=True,
+            )
+    try:
+        safe_content = renderer(artifact.content)
+    except (TypeError, ValueError) as error:
+        raise ToolExecutionError(
+            "ARTIFACT_STALE",
+            f"Artifact content is stale: {artifact.kind} {artifact.id}",
+            recoverable=True,
+        ) from error
+    rendered = json.dumps(safe_content, sort_keys=True)
+    if len(rendered) > _MAX_OPEN_CHARS:
+        rendered = rendered[:_MAX_OPEN_CHARS] + "..."
+    reference = ArtifactRef(
+        id=artifact.id,
+        kind=artifact.kind,
+        version=artifact.version,
+    )
+    return ToolResult(
+        message=f"{artifact.kind} {artifact.id} version {artifact.version}: {rendered}",
+        artifacts=(reference,),
+    )
+
+
+def _raise_missing_result(code: str, message: str) -> None:
+    raise ToolExecutionError(
+        code,
+        message,
+        recoverable=True,
+    )
+
+
+def _catalog_field_exists(context: ToolContext, table: str, column: str) -> bool:
+    field_exists = getattr(
+        require_context_study(context).catalog,
+        "field_exists",
+        None,
+    )
+    if not callable(field_exists):
+        raise ToolExecutionError(
+            "CATALOG_UNAVAILABLE",
+            "The active study does not provide runtime field validation.",
+            recoverable=True,
+        )
+    return bool(field_exists(table, column))
+
+
+def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+    limit = min(int(arguments["limit"]), _MAX_SEARCH_HITS)
+    queries = list(arguments["queries"])
+    study = require_context_study(context)
+    search_many = getattr(study.catalog, "search_many", None)
+    if not callable(search_many):
+        raise ToolExecutionError(
+            "CATALOG_UNAVAILABLE",
+            "The active study does not provide batched catalog search.",
+            recoverable=True,
+        )
+    source_ids = sorted(str(source_id) for source_id in study.data_sources)
+    hits: list[dict[str, Any]] = []
+    provider_batches = search_many(queries, limit=limit)
+    if len(provider_batches) != len(queries):
+        raise ToolExecutionError(
+            "CATALOG_RESPONSE_INVALID",
+            "Catalog search did not return one result batch per semantic probe.",
+            recoverable=True,
+        )
+    for query, provider_hits in zip(queries, provider_batches):
+        for provider_hit in provider_hits:
+            hit = _schema_evidence_hit(provider_hit)
+            source = str(hit.get("source") or "").strip()
+            if not source and len(source_ids) == 1:
+                source = source_ids[0]
+            if source and source not in source_ids:
+                raise ToolExecutionError(
+                    "CATALOG_SOURCE_UNAVAILABLE",
+                    "Catalog evidence references an unavailable runtime source.",
+                    recoverable=True,
+                )
+            if source:
+                hit["source"] = source
+                hit["provenance"] = {
+                    **dict(hit.get("provenance") or {}),
+                    "source_id": source,
+                }
+            hit["retrieval_probe"] = query
+            hits.append(hit)
+    content = {
+        "queries": queries,
+        "source_ids": source_ids,
+        "hits": hits[:_MAX_CATALOG_HITS],
+    }
+    reference = _save_observation(
+        context,
+        kind="catalog_search",
+        content=content,
+        producer="dbrag-search_catalog",
+        summary=(
+            f"{len(content['hits'])} schema catalog hits for "
+            f"{len(queries)} probes"
+        ),
+    )
+    return ToolResult(
+        message=json.dumps(_render_catalog(content), sort_keys=True),
+        artifacts=(reference,),
+    )
+
+
+def _inspect_table(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+    _require_source(context, arguments["source"])
+    inspect_table = getattr(
+        require_context_study(context).catalog,
+        "inspect_table",
+        None,
+    )
+    if not callable(inspect_table):
+        raise ToolExecutionError(
+            "CATALOG_UNAVAILABLE",
+            "The active study does not provide exact table inspection.",
+            recoverable=True,
+        )
+    offset = int(arguments["offset"])
+    limit = int(arguments["limit"])
+    provider_fields = inspect_table(
+        arguments["source"],
+        arguments["table"],
+        offset=offset,
+        limit=limit + 1,
+    )
+    fields = []
+    for provider_hit in provider_fields[:limit]:
+        hit = _schema_evidence_hit(provider_hit)
+        if hit.get("source") != arguments["source"]:
+            raise ToolExecutionError(
+                "CATALOG_SOURCE_MISMATCH",
+                "Exact table evidence does not match the requested runtime source.",
+                recoverable=True,
+            )
+        fields.append(hit)
+    if not fields:
+        _raise_missing_result(
+            "TABLE_NOT_FOUND",
+            f"Runtime table is unavailable: {arguments['table']}",
+        )
+    content = {
+        "source": arguments["source"],
+        "table": arguments["table"],
+        "offset": offset,
+        "next_offset": (
+            offset + limit
+            if len(provider_fields) > limit
+            else None
+        ),
+        "fields": fields,
+    }
+    reference = _save_observation(
+        context,
+        kind="table_profile",
+        content=content,
+        producer="dbrag-inspect_table",
+        summary=f"Bounded schema profile for {arguments['table']}",
+    )
+    return ToolResult(
+        message=json.dumps(_render_catalog(content), sort_keys=True),
+        artifacts=(reference,),
+    )
+
+
+def _find_join_paths(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+    required_fields = arguments["required_fields"]
+    sources = {field["source"] for field in required_fields}
+    if len(sources) != 1:
+        raise ToolExecutionError(
+            "CROSS_SOURCE_RELATIONSHIP_UNAVAILABLE",
+            "Join-path discovery requires fields from one runtime source.",
+            recoverable=True,
+        )
+    source_name = next(iter(sources))
+    _require_source(context, source_name)
+    for field in required_fields:
+        if not _catalog_field_exists(context, field["table"], field["column"]):
+            _raise_missing_result(
+                "JOIN_PATH_UNAVAILABLE",
+                (
+                    "Join-path field is unavailable: "
+                    f"{field['table']}.{field['column']}"
+                ),
+            )
+    tables = list(dict.fromkeys(field["table"] for field in required_fields))
+    if len(tables) < 2:
+        raise ToolExecutionError(
+            "JOIN_PATH_NOT_REQUIRED",
+            "Join-path discovery requires at least two runtime tables.",
+            recoverable=True,
+        )
+
+    inventory = _relationship_inventory(context, source_name)
+    paths: list[dict[str, Any]] = []
+    for left_index, left_table in enumerate(tables):
+        for right_table in tables[left_index + 1 :]:
+            remaining = arguments["max_paths"] - len(paths)
+            if remaining <= 0:
+                break
+            try:
+                found = inventory.find_join_paths(
+                    left_table,
+                    right_table,
+                    max_hops=arguments["max_hops"],
+                    max_paths=remaining,
+                )
+            except (KeyError, ValueError) as error:
+                raise ToolExecutionError(
+                    "JOIN_PATH_UNAVAILABLE",
+                    (
+                        "No runtime join path is available between "
+                        f"{left_table} and {right_table}."
+                    ),
+                    recoverable=True,
+                ) from error
+            paths.extend(_bounded_model_dump(path) for path in found)
+    if not paths:
+        _raise_missing_result(
+            "JOIN_PATH_UNAVAILABLE",
+            "No observed runtime join path covers the requested fields.",
+        )
+    content = {
+        "source": source_name,
+        "required_fields": required_fields,
+        "paths": paths,
+    }
+    reference = _save_observation(
+        context,
+        kind="relationship_profile",
+        content=content,
+        producer="dbrag-find_join_paths",
+        summary=f"{len(paths)} observed join paths",
+    )
+    return ToolResult(
+        message=json.dumps(_render_relationship(content), sort_keys=True),
+        artifacts=(reference,),
+    )
+
+
+def _profile_relationship(
+    arguments: dict[str, Any],
+    context: ToolContext,
+) -> ToolResult:
+    inventory = _relationship_inventory(context, arguments["source"])
+    key_pairs = [
+        (pair["left_column"], pair["right_column"])
+        for pair in arguments["key_pairs"]
+    ]
+    try:
+        profile = inventory.profile_relationship(
+            arguments["left_table"],
+            arguments["right_table"],
+            key_pairs,
+        )
+    except (KeyError, ValueError) as error:
+        raise ToolExecutionError(
+            "RELATIONSHIP_UNAVAILABLE",
+            (
+                "The requested runtime relationship could not be profiled "
+                f"between {arguments['left_table']} and {arguments['right_table']}."
+            ),
+            recoverable=True,
+        ) from error
+    profile_content = _bounded_model_dump(profile)
+    content = {"source": arguments["source"], "profile": profile_content}
+    reference = _save_observation(
+        context,
+        kind="relationship_profile",
+        content=content,
+        producer="dbrag-profile_relationship",
+        summary=(
+            f"Observed relationship between {arguments['left_table']} "
+            f"and {arguments['right_table']}"
+        ),
+    )
+    return ToolResult(
+        message=json.dumps(_render_relationship(content), sort_keys=True),
+        artifacts=(reference,),
+    )
+
+
+def _save_dataset_plan(
+    arguments: dict[str, Any],
+    context: ToolContext,
+) -> ToolResult:
+    prior_id = arguments.get("prior_id")
+    prior_version = arguments.get("prior_version")
+    if (prior_id is None) != (prior_version is None):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENTS",
+            "prior_id and prior_version must be provided together.",
+            recoverable=True,
+        )
+    if prior_id is not None and prior_version is not None:
+        prior = _require_artifact(
+            context,
+            artifact_id=prior_id,
+            version=prior_version,
+            kind="dataset_plan",
+        )
+        revision_authorized = any(
+            feedback.status == "active"
+            and feedback.content.get("action") == "revise"
+            and feedback.content.get("plan_id") == prior_id
+            and feedback.content.get("plan_version") == prior_version
+            for feedback in _store(context).list_artifacts(
+                kind="dataset_review_feedback"
+            )
+        )
+        if prior.status == "approved" and not revision_authorized:
+            raise ToolExecutionError(
+                "PLAN_REVISION_NOT_AUTHORIZED",
+                (
+                    "The approved dataset plan remains the exact human-reviewed "
+                    "contract. Repair and retry SQL against the same approved plan; "
+                    "do not save or request review for another dataset plan."
+                ),
+                recoverable=True,
+            )
+    try:
+        reference = _store(context).save_dataset_plan(
+            DatasetPlan.model_validate(arguments["plan"]),
+            prior_id=prior_id,
+            prior_version=prior_version,
+            provenance={
+                "study_id": require_context_study(context).study_id,
+                "thread_id": context.thread_id,
+                "producer": "dbrag-save_dataset_plan",
+            },
+        )
+    except KeyError as error:
+        raise ToolExecutionError(
+            "ARTIFACT_STALE",
+            "The prior dataset plan revision is stale.",
+            recoverable=True,
+        ) from error
+    return ToolResult(
+        message=(
+            f"Saved dataset plan plan_id={reference.id} "
+            f"version={reference.version} status=draft."
+        ),
+        artifacts=(reference,),
+    )
+
+
+def _plan_output_fields(plan: DatasetPlan) -> list[PlanField]:
+    fields = [
+        field
+        for field in plan.required_fields
+        if field.roles & {"requested", "identifier", "grain"}
+    ]
+    for concept in plan.concepts:
+        fields.extend(
+            field
+            for field in concept.fields
+            if field.roles & {"requested", "identifier", "grain"}
+        )
+    return fields
+
+
+def _validate_plan_field_role(
+    field: PlanField,
+    *,
+    required_role: str,
+    path: str,
+) -> None:
+    if required_role in field.roles:
+        return
+    if required_role == "requested":
+        message = (
+            "A field assigned to a requested scientific concept must declare "
+            "the requested role."
+        )
+    else:
+        message = (
+            "A field in required_fields must declare the identifier role."
+        )
+    _raise_plan_error(
+        "PLAN_ROLE_COLLECTION_INVALID",
+        message,
+        details={
+            "path": path,
+            "source": field.source,
+            "table": field.table,
+            "column": field.column,
+        },
+    )
+
+
+def _plan_issue(
+    error: ToolExecutionError,
+    *,
+    path: str | None = None,
+    source: str | None = None,
+    table: str | None = None,
+    column: str | None = None,
+) -> dict[str, Any]:
+    issue: dict[str, Any] = {
+        "code": error.code,
+        "message": str(error),
+    }
+    if error.details:
+        issue.update(error.details)
+    if path and "path" not in issue:
+        issue["path"] = path
+    for name, value in (("source", source), ("table", table), ("column", column)):
+        if value and name not in issue:
+            issue[name] = value
+    issue.setdefault(
+        "repair",
+        _PLAN_REPAIR_HINTS.get(
+            error.code,
+            "Revise the plan entry identified by path and validate the plan again.",
+        ),
+    )
+    return issue
+
+
+def _collect_plan_check(
+    issues: list[dict[str, Any]],
+    check: Callable[[], None],
+    *,
+    path: str | None = None,
+    source: str | None = None,
+    table: str | None = None,
+    column: str | None = None,
+) -> None:
+    try:
+        check()
+    except ToolExecutionError as error:
+        issue = _plan_issue(
+            error,
+            path=path,
+            source=source,
+            table=table,
+            column=column,
+        )
+        signature = (
+            issue.get("code"),
+            issue.get("message"),
+            issue.get("source"),
+            issue.get("table"),
+            issue.get("column"),
+        )
+        if not any(
+            (
+                existing.get("code"),
+                existing.get("message"),
+                existing.get("source"),
+                existing.get("table"),
+                existing.get("column"),
+            )
+            == signature
+            for existing in issues
+        ):
+            issues.append(issue)
+
+
+def _raise_collected_plan_errors(issues: list[dict[str, Any]]) -> None:
+    if not issues:
+        return
+    if len(issues) == 1:
+        code = str(issues[0]["code"])
+        message = str(issues[0]["message"])
+    else:
+        code = "PLAN_VALIDATION_FAILED"
+        locations = ", ".join(
+            f"{issue['code']} at {issue.get('path', 'plan')}"
+            for issue in issues
+        )
+        message = (
+            f"Dataset plan validation found {len(issues)} independent issues. "
+            f"Issues: {locations}. Address every issue in details.issues and "
+            "validate the revised plan."
+        )
+    raise ToolExecutionError(
+        code,
+        message,
+        recoverable=True,
+        details={"issues": issues},
+    )
+
+
+def _plan_reference_keys(plan: DatasetPlan) -> set[tuple[str, str, str]]:
+    keys = {
+        (field.source, field.table, field.column)
+        for field in _plan_output_fields(plan)
+    }
+    for operation in plan.operations:
+        for reference in operation.field_refs:
+            keys.add((reference.source, reference.table, reference.column))
+        if operation.name.strip().casefold() != "join" or not operation.source:
+            continue
+        left_table = str(operation.left_table or "").strip()
+        right_table = str(operation.right_table or "").strip()
+        for pair in operation.key_pairs:
+            keys.add((operation.source, left_table, pair.left_column))
+            keys.add((operation.source, right_table, pair.right_column))
+    for filter_entry in plan.filters:
+        for reference in [
+            *list(filter_entry.get("referenced_columns") or []),
+            *list(filter_entry.get("value_constraints") or []),
+        ]:
+            source = str(reference.get("source") or "").strip()
+            table = str(reference.get("table") or "").strip()
+            column = str(reference.get("column") or "").strip()
+            if source and table and column:
+                keys.add((source, table, column))
+    for reduction in plan.reductions:
+        for reference in [*reduction.group_by, reduction.order_by, *reduction.tie_breakers]:
+            if reference is not None:
+                keys.add((reference.source, reference.table, reference.column))
+        for aggregate in reduction.aggregates:
+            keys.add((aggregate.field.source, aggregate.field.table, aggregate.field.column))
+        for filter_entry in reduction.filters:
+            for reference in [
+                *list(filter_entry.get("referenced_columns") or []),
+                *list(filter_entry.get("value_constraints") or []),
+            ]:
+                if isinstance(reference, dict):
+                    source = str(reference.get("source") or reduction.source).strip()
+                    table = str(reference.get("table") or reduction.table).strip()
+                    column = str(reference.get("column") or "").strip()
+                    if source and table and column:
+                        keys.add((source, table, column))
+    return keys
+
+
+def _validate_plan_reduction(
+    reduction: Any,
+    *,
+    context: ToolContext,
+) -> None:
+    if reduction.source not in require_context_study(context).data_sources:
+        _raise_plan_error(
+            "PLAN_SOURCE_UNAVAILABLE",
+            f"Reduction references unavailable source {reduction.source}.",
+            details={"source": reduction.source, "table": reduction.table},
+        )
+    references = [*reduction.group_by, reduction.order_by, *reduction.tie_breakers]
+    references.extend(aggregate.field for aggregate in reduction.aggregates)
+    for reference in references:
+        if reference is None:
+            continue
+        reference_details = {
+            "source": reference.source,
+            "table": reference.table,
+            "column": reference.column,
+        }
+        if reference.source != reduction.source or reference.table != reduction.table:
+            _raise_plan_error(
+                "PLAN_REDUCTION_REFERENCE_INVALID",
+                "Reduction fields must belong to its declared source table.",
+                details=reference_details,
+            )
+        if not _catalog_field_exists(context, reference.table, reference.column):
+            _raise_plan_error(
+                "PLAN_REDUCTION_FIELD_UNAVAILABLE",
+                f"Reduction field is unavailable: {reference.table}.{reference.column}.",
+                details=reference_details,
+            )
+    _validate_plan_filter_contract(reduction.filters)
+    for filter_entry in reduction.filters:
+        for constraint in filter_entry.get("value_constraints") or []:
+            if not isinstance(constraint, dict):
+                continue
+            table = str(constraint.get("table") or reduction.table).strip()
+            column = str(constraint.get("column") or "").strip()
+            if table != reduction.table or not _catalog_field_exists(context, table, column):
+                _raise_plan_error(
+                    "PLAN_REDUCTION_FILTER_INVALID",
+                    "Reduction filters must use available fields from the reduced table.",
+                    details={
+                        "source": reduction.source,
+                        "table": table,
+                        "column": column,
+                    },
+                )
+
+def _raise_plan_error(
+    code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> None:
+    raise ToolExecutionError(
+        code,
+        message,
+        recoverable=True,
+        details=details,
+    )
+
+
+def _validate_plan_filter_contract(filters: list[dict[str, Any]]) -> None:
+    for filter_entry in filters:
+        description = str(filter_entry.get("description") or "").strip()
+        predicate = str(filter_entry.get("predicate") or "").strip()
+        references = [
+            item
+            for item in list(filter_entry.get("referenced_columns") or [])
+            if isinstance(item, dict)
+        ]
+        constraints = [
+            item
+            for item in list(filter_entry.get("value_constraints") or [])
+            if isinstance(item, dict)
+        ]
+        if not description or (not predicate and not constraints):
+            _raise_plan_error(
+                "PLAN_FILTER_CANONICAL_REQUIRED",
+                (
+                    "Each dataset-plan filter requires a description and either "
+                    "a canonical predicate or value_constraints."
+                ),
+            )
+        if predicate and not references:
+            _raise_plan_error(
+                "PLAN_FILTER_CANONICAL_REQUIRED",
+                (
+                    "A canonical filter predicate requires referenced_columns "
+                    "that identify every reviewed predicate field."
+                ),
+            )
+        for constraint in constraints:
+            has_value = "value" in constraint
+            has_values = "values" in constraint
+            value = constraint.get("value")
+            values = constraint.get("values")
+            if (
+                not str(constraint.get("table") or "").strip()
+                or not str(constraint.get("column") or "").strip()
+                or not str(constraint.get("operator") or "").strip()
+                or has_value == has_values
+                or (
+                    has_value
+                    and (
+                        value is None
+                        or (
+                            isinstance(value, str)
+                            and not value.strip()
+                        )
+                    )
+                )
+                or (
+                    has_values
+                    and (
+                        not isinstance(values, list)
+                        or not values
+                    )
+                )
+            ):
+                _raise_plan_error(
+                    "PLAN_FILTER_CANONICAL_REQUIRED",
+                    (
+                        "Each value constraint requires table, column, operator, "
+                        "and exactly one non-empty value or values field."
+                    ),
+                )
+
+
+def _resolve_plan_filter_references(
+    filters: list[dict[str, Any]],
+    field_keys: set[tuple[str, str, str]],
+) -> None:
+    try:
+        resolve_filter_references(
+            filters,
+            available_fields=field_keys,
+        )
+    except FilterReferenceResolutionError as error:
+        _raise_plan_error(error.code, str(error))
+
+
+def _operation_key_pairs(operation: dict[str, Any]) -> list[tuple[str, str]]:
+    raw_pairs = operation.get("key_pairs")
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        _raise_plan_error(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Join operation requires explicit relationship key pairs.",
+        )
+    pairs: list[tuple[str, str]] = []
+    for pair in raw_pairs:
+        if not isinstance(pair, dict):
+            _raise_plan_error(
+                "PLAN_RELATIONSHIP_UNPROVEN",
+                "Join operation relationship key pairs are malformed.",
+            )
+        left = str(pair.get("left_column") or "").strip()
+        right = str(pair.get("right_column") or "").strip()
+        if not left or not right:
+            _raise_plan_error(
+                "PLAN_RELATIONSHIP_UNPROVEN",
+                "Join operation relationship key pairs are incomplete.",
+            )
+        pairs.append((left, right))
+    return pairs
+
+
+def _relationship_profiles(content: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    profile = content.get("profile")
+    if isinstance(profile, dict):
+        profiles.append(profile)
+    for path in content.get("paths") or []:
+        if not isinstance(path, dict):
+            continue
+        profiles.extend(
+            profile
+            for profile in path.get("profiles") or []
+            if isinstance(profile, dict)
+        )
+    return profiles
+
+
+def _profile_key_pairs(profile: dict[str, Any]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for pair in profile.get("key_pairs") or []:
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            pairs.append((str(pair[0]), str(pair[1])))
+    return pairs
+
+
+def _profile_matches_operation(
+    profile: dict[str, Any],
+    *,
+    left_table: str,
+    right_table: str,
+    key_pairs: list[tuple[str, str]],
+) -> bool:
+    profile_left = str(profile.get("left_table") or "")
+    profile_right = str(profile.get("right_table") or "")
+    profile_pairs = _profile_key_pairs(profile)
+    if profile_left == left_table and profile_right == right_table:
+        return profile_pairs == key_pairs
+    if profile_left == right_table and profile_right == left_table:
+        return profile_pairs == [(right, left) for left, right in key_pairs]
+    return False
+
+
+def _plan_relationship_metrics(
+    context: ToolContext,
+    plan: DatasetPlan,
+) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    for model in plan.operations:
+        operation = model.model_dump(mode="json")
+        if str(operation.get("name") or "").strip().casefold() != "join":
+            continue
+        artifact_id = str(
+            operation.get("relationship_artifact_id") or ""
+        ).strip()
+        artifact_version = operation.get("relationship_artifact_version")
+        relationship = _require_artifact(
+            context,
+            artifact_id=artifact_id,
+            version=artifact_version,
+            kind="relationship_profile",
+        )
+        key_pairs = _operation_key_pairs(operation)
+        profile = next(
+            (
+                value
+                for value in _relationship_profiles(relationship.content)
+                if _profile_matches_operation(
+                    value,
+                    left_table=str(operation.get("left_table") or ""),
+                    right_table=str(operation.get("right_table") or ""),
+                    key_pairs=key_pairs,
+                )
+            ),
+            None,
+        )
+        if profile is None:
+            raise ToolExecutionError(
+                "PLAN_RELATIONSHIP_UNPROVEN",
+                "Approved join relationship evidence is no longer available.",
+                recoverable=True,
+            )
+        metrics.append(
+            {
+                "evidence_label": "profiled relationship risk",
+                "relationship_artifact_id": relationship.id,
+                "relationship_artifact_version": relationship.version,
+                **dict(profile),
+            }
+        )
+    return metrics
+
+
+def _validate_operation(
+    operation: dict[str, Any],
+    *,
+    context: ToolContext,
+    plan_fields: set[tuple[str, str, str]],
+) -> None:
+    operation_name = str(operation.get("type") or operation.get("name") or "").strip()
+    if not operation_name:
+        _raise_plan_error("PLAN_OPERATION_INVALID", "Plan operation has no runtime type.")
+
+    source_name = str(operation.get("source") or "").strip()
+    if (
+        source_name
+        and source_name not in require_context_study(context).data_sources
+    ):
+        _raise_plan_error(
+            "PLAN_SOURCE_UNAVAILABLE",
+            f"Plan operation references unavailable source {source_name}.",
+        )
+
+    for raw_field in operation.get("field_refs") or []:
+        if not isinstance(raw_field, dict):
+            _raise_plan_error(
+                "PLAN_OPERATION_INVALID",
+                "Plan operation field reference is not structured.",
+            )
+        key = tuple(
+            str(raw_field.get(part) or "").strip()
+            for part in ("source", "table", "column")
+        )
+        if not all(key) or key not in plan_fields:
+            _raise_plan_error(
+                "PLAN_OPERATION_INVALID",
+                "Plan operation references a field outside the plan.",
+            )
+
+    if operation_name.casefold() != "join":
+        return
+    join_type = str(operation.get("join_type") or "").strip().casefold()
+    if not join_type:
+        _raise_plan_error(
+            "PLAN_JOIN_STRATEGY_REQUIRED",
+            "Join operation requires an explicit join_type strategy.",
+        )
+    if join_type not in {"inner", "left"}:
+        _raise_plan_error(
+            "PLAN_JOIN_STRATEGY_UNSUPPORTED",
+            (
+                "Join operation uses an unsupported join_type. "
+                "The base protocol supports inner and left."
+            ),
+        )
+    required_values = {
+        key: str(operation.get(key) or "").strip()
+        for key in ("source", "left_table", "right_table")
+    }
+    if not all(required_values.values()):
+        _raise_plan_error(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Join operation requires source, left_table, and right_table.",
+        )
+    key_pairs = _operation_key_pairs(operation)
+    relationship_id = str(operation.get("relationship_artifact_id") or "").strip()
+    relationship_version = operation.get("relationship_artifact_version")
+    if not relationship_id or not isinstance(relationship_version, int):
+        _raise_plan_error(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Join operation requires an exact relationship artifact reference.",
+        )
+    relationship = _require_artifact(
+        context,
+        artifact_id=relationship_id,
+        version=relationship_version,
+        kind="relationship_profile",
+    )
+    if str(relationship.content.get("source") or "") != required_values["source"]:
+        _raise_plan_error(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Join operation source does not match relationship evidence.",
+        )
+    if not any(
+        _profile_matches_operation(
+            profile,
+            left_table=required_values["left_table"],
+            right_table=required_values["right_table"],
+            key_pairs=key_pairs,
+        )
+        for profile in _relationship_profiles(relationship.content)
+    ):
+        _raise_plan_error(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Join operation does not match an exact profiled relationship edge.",
+        )
+    for left_column, right_column in key_pairs:
+        for table, column in (
+            (required_values["left_table"], left_column),
+            (required_values["right_table"], right_column),
+        ):
+            if not _catalog_field_exists(context, table, column):
+                _raise_plan_error(
+                    "PLAN_JOIN_KEY_MISSING",
+                    f"Runtime join key is unavailable: {table}.{column}.",
+                )
+
+
+def _validate_plan_table_graph(
+    plan: DatasetPlan,
+    *,
+    plan_fields: set[tuple[str, str, str]],
+) -> None:
+    table_refs = {(source, table) for source, table, _column in plan_fields}
+    for operation in plan.operations:
+        if operation.name.strip().casefold() != "join" or not operation.source:
+            continue
+        table_refs.add((operation.source, str(operation.left_table or "").strip()))
+        table_refs.add((operation.source, str(operation.right_table or "").strip()))
+    if len(table_refs) < 2:
+        return
+
+    adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {
+        table_ref: set() for table_ref in table_refs
+    }
+    for model in plan.operations:
+        operation = model.model_dump(mode="json")
+        operation_name = str(
+            operation.get("type") or operation.get("name") or ""
+        ).strip().casefold()
+        if operation_name != "join":
+            continue
+        source = str(operation.get("source") or "").strip()
+        left = (source, str(operation.get("left_table") or "").strip())
+        right = (source, str(operation.get("right_table") or "").strip())
+        if left not in table_refs or right not in table_refs:
+            continue
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+
+    root = next(iter(table_refs))
+    connected = {root}
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        for neighbor in adjacency[current]:
+            if neighbor in connected:
+                continue
+            connected.add(neighbor)
+            pending.append(neighbor)
+    if connected != table_refs:
+        _raise_plan_error(
+            "PLAN_TABLE_GRAPH_DISCONNECTED",
+            (
+                "Every selected table must belong to one connected set of "
+                "explicit, evidence-backed join operations before review."
+            ),
+        )
+
+
+def _validate_dataset_plan(
+    arguments: dict[str, Any],
+    context: ToolContext,
+) -> ToolResult:
+    reference = ArtifactRef(
+        id=arguments["plan_id"],
+        kind="dataset_plan",
+        version=arguments["plan_version"],
+    )
+    stored = _require_artifact(
+        context,
+        artifact_id=reference.id,
+        version=reference.version,
+        kind=reference.kind,
+    )
+    plan = DatasetPlan.model_validate(stored.content)
+    issues: list[dict[str, Any]] = []
+    if not plan.row_definition.strip():
+        _collect_plan_check(
+            issues,
+            lambda: _raise_plan_error(
+                "PLAN_ROW_DEFINITION_MISSING",
+                "Dataset plan requires a non-empty row definition.",
+            ),
+            path="row_definition",
+        )
+    if plan.unresolved:
+        _collect_plan_check(
+            issues,
+            lambda: _raise_plan_error(
+                "PLAN_UNRESOLVED",
+                "Dataset plan still contains unresolved items.",
+            ),
+            path="unresolved",
+        )
+    for field_index, field in enumerate(plan.required_fields):
+        _collect_plan_check(
+            issues,
+            lambda field=field, path=f"required_fields[{field_index}]": _validate_plan_field_role(
+                field,
+                required_role="identifier",
+                path=path,
+            ),
+            path=f"required_fields[{field_index}]",
+            source=field.source,
+            table=field.table,
+            column=field.column,
+        )
+    for concept_index, concept in enumerate(plan.concepts):
+        for field_index, field in enumerate(concept.fields):
+            path = f"concepts[{concept_index}].fields[{field_index}]"
+            _collect_plan_check(
+                issues,
+                lambda field=field, path=path: _validate_plan_field_role(
+                    field,
+                    required_role="requested",
+                    path=path,
+                ),
+                path=path,
+                source=field.source,
+                table=field.table,
+                column=field.column,
+            )
+    for reduction_index, reduction in enumerate(plan.reductions):
+        _collect_plan_check(
+            issues,
+            lambda reduction=reduction: _validate_plan_reduction(
+                reduction,
+                context=context,
+            ),
+            path=f"reductions[{reduction_index}]",
+        )
+    for concept_index, concept in enumerate(plan.concepts):
+        if not concept.fields:
+            _collect_plan_check(
+                issues,
+                lambda: _raise_plan_error(
+                    "PLAN_CONCEPT_UNASSIGNED",
+                    (
+                        "Every requested analysis concept requires at least one "
+                        "runtime field assignment before review."
+                    ),
+                ),
+                path=f"concepts[{concept_index}].fields",
+            )
+
+    field_specs = [
+        (field, f"required_fields[{field_index}]")
+        for field_index, field in enumerate(plan.required_fields)
+    ]
+    field_specs.extend(
+        (
+            field,
+            f"concepts[{concept_index}].fields[{field_index}]",
+        )
+        for concept_index, concept in enumerate(plan.concepts)
+        for field_index, field in enumerate(concept.fields)
+    )
+    if any(field.aggregation for field in plan.required_fields):
+        _collect_plan_check(
+            issues,
+            lambda: _raise_plan_error(
+                "PLAN_IDENTITY_AGGREGATION_INVALID",
+                "Required identity fields cannot be aggregated.",
+            ),
+            path="required_fields",
+        )
+    field_keys = _plan_reference_keys(plan)
+    output_sources: dict[str, tuple[str, str, str]] = {}
+    for field, path in field_specs:
+
+        def validate_field(field: PlanField = field) -> None:
+            field_details = {
+                "source": field.source,
+                "table": field.table,
+                "column": field.column,
+            }
+            if field.source not in require_context_study(context).data_sources:
+                _raise_plan_error(
+                    "PLAN_SOURCE_UNAVAILABLE",
+                    f"Plan field references unavailable source {field.source}.",
+                    details=field_details,
+                )
+            if not _catalog_field_exists(context, field.table, field.column):
+                _raise_plan_error(
+                    "PLAN_FIELD_UNAVAILABLE",
+                    f"Runtime field is unavailable: {field.table}.{field.column}.",
+                    details=field_details,
+                )
+            field_key = (field.source, field.table, field.column)
+            output_name = str(field.output_column or field.column).strip()
+            prior_source = output_sources.get(output_name)
+            if prior_source is not None and prior_source != field_key:
+                _raise_plan_error(
+                    "PLAN_OUTPUT_NAME_CONFLICT",
+                    f"Multiple source fields produce output column {output_name}.",
+                    details={**field_details, "output_column": output_name},
+                )
+            output_sources[output_name] = field_key
+
+        _collect_plan_check(
+            issues,
+            validate_field,
+            path=path,
+            source=field.source,
+            table=field.table,
+            column=field.column,
+        )
+
+    for source, table, column in sorted(field_keys):
+        def validate_reference(
+            source: str = source,
+            table: str = table,
+            column: str = column,
+        ) -> None:
+            reference_details = {
+                "source": source,
+                "table": table,
+                "column": column,
+            }
+            if source not in require_context_study(context).data_sources:
+                _raise_plan_error(
+                    "PLAN_SOURCE_UNAVAILABLE",
+                    f"Plan reference uses unavailable source {source}.",
+                    details=reference_details,
+                )
+            if not _catalog_field_exists(context, table, column):
+                _raise_plan_error(
+                    "PLAN_FIELD_UNAVAILABLE",
+                    f"Runtime field is unavailable: {table}.{column}.",
+                    details=reference_details,
+                )
+
+        _collect_plan_check(
+            issues,
+            validate_reference,
+            path=f"references[{source}.{table}.{column}]",
+            source=source,
+            table=table,
+            column=column,
+        )
+
+    _collect_plan_check(
+        issues,
+        lambda: _resolve_plan_filter_references(plan.filters, field_keys),
+        path="filters",
+    )
+    for filter_index, filter_entry in enumerate(plan.filters):
+        _collect_plan_check(
+            issues,
+            lambda filter_entry=filter_entry: _validate_plan_filter_contract([filter_entry]),
+            path=f"filters[{filter_index}]",
+        )
+
+    for operation_index, operation in enumerate(plan.operations):
+        _collect_plan_check(
+            issues,
+            lambda operation=operation: _validate_operation(
+                operation.model_dump(mode="json"),
+                context=context,
+                plan_fields=field_keys,
+            ),
+            path=f"operations[{operation_index}]",
+        )
+    _collect_plan_check(
+        issues,
+        lambda: _validate_plan_table_graph(plan, plan_fields=field_keys),
+        path="operations",
+    )
+    _raise_collected_plan_errors(issues)
+    return ToolResult(
+        message=(
+            f"Dataset plan version {reference.version} passed deterministic "
+            "runtime validation."
+        ),
+        artifacts=(reference,),
+    )
+
+
+def _approved_plan(
+    context: ToolContext,
+    *,
+    plan_id: str,
+    plan_version: int,
+) -> tuple[Any, DatasetPlan]:
+    stored = _require_artifact(
+        context,
+        artifact_id=plan_id,
+        version=plan_version,
+        kind="dataset_plan",
+    )
+    if stored.status != "approved":
+        raise ToolExecutionError(
+            "PLAN_VERSION_NOT_APPROVED",
+            (
+                f"Dataset plan {plan_id} version {plan_version} has "
+                f"status={stored.status}; exact approval is required."
+            ),
+            recoverable=True,
+        )
+    return stored, DatasetPlan.model_validate(stored.content)
+
+
+def _plan_columns(plan: DatasetPlan) -> list[dict[str, Any]]:
+    return [
+        field.model_dump(mode="json")
+        for field in _plan_output_fields(plan)
+    ]
+
+
+def _plan_reference_columns(plan: DatasetPlan) -> list[dict[str, Any]]:
+    return [
+        {"source": source, "table": table, "column": column}
+        for source, table, column in sorted(_plan_reference_keys(plan))
+        if source and table and column
+    ]
+
+
+def _plan_row_filters(plan: DatasetPlan) -> dict[str, Any]:
+    try:
+        resolved = resolve_filter_references(
+            plan.filters,
+            available_fields=_plan_reference_keys(plan),
+        )
+    except FilterReferenceResolutionError as error:
+        raise ToolExecutionError(
+            error.code,
+            str(error),
+            recoverable=True,
+        ) from error
+    return {
+        "population": [],
+        "data_quality": [],
+        "explicit_value": resolved,
+    }
+
+
+def _plan_protected_columns(plan: DatasetPlan) -> list[dict[str, Any]]:
+    protected: list[dict[str, Any]] = []
+    for concept in plan.concepts:
+        content = concept.model_dump(mode="json")
+        concept_role = str(
+            content.get("role") or content.get("variable_role") or ""
+        ).strip().casefold()
+        for field in content.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            if concept_role == "outcome" or bool(field.get("protected")):
+                protected.append(dict(field))
+    return protected
+
+
+def _plan_runtime_path(context: ToolContext, plan: DatasetPlan) -> Any:
+    sources = {
+        str(column.get("source") or "").strip()
+        for column in _plan_columns(plan)
+        if str(column.get("source") or "").strip()
+    }
+    if len(sources) != 1:
+        raise ToolExecutionError(
+            "SQL_SOURCE_UNAVAILABLE",
+            "Agent SQL execution currently requires one approved runtime source.",
+            recoverable=True,
+        )
+    source = _require_source(context, next(iter(sources)))
+    path = getattr(source, "path", None)
+    if path is None:
+        raise ToolExecutionError(
+            "SQL_SOURCE_UNAVAILABLE",
+            "The approved runtime source does not provide DuckDB execution.",
+            recoverable=True,
+        )
+    return path
+
+
+def _sql_error_code(error: ValueError) -> str:
+    message = str(error).casefold()
+    if (
+        "unapproved operation" in message
+        or "row-shaping" in message
+    ):
+        return "SQL_UNAPPROVED_OPERATION"
+    if (
+        "relation" in message
+        or "external scan" in message
+        or "table function" in message
+    ):
+        return "SQL_UNAPPROVED_RELATION"
+    if (
+        "unapproved output" in message
+        or "unapproved source field" in message
+        or "unapproved column" in message
+        or "unapproved table" in message
+        or "approved source column" in message
+        or "output alias" in message
+        or "projection source" in message
+        or "projection must include" in message
+    ):
+        return "SQL_UNAPPROVED_SCHEMA"
+    if (
+        "row filter" in message
+        or "row predicate" in message
+        or "filter boolean" in message
+    ):
+        return "SQL_UNAPPROVED_FILTER"
+    if "approved plan operation" in message or "approved plan" in message and "join" in message:
+        return "SQL_UNAPPROVED_OPERATION"
+    return "SQL_VALIDATION_FAILED"
+
+
+def _sql_repair_details(
+    *,
+    plan_id: str,
+    plan_version: int,
+    origin: str,
+    stage: str,
+    attempted_sql: str | None,
+    error: Exception,
+    tables: list[str],
+    columns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "status": "repair_required",
+        "plan": {"id": plan_id, "version": plan_version},
+        "origin": origin,
+        "stage": stage,
+        "attempted_sql": str(attempted_sql or "")[:12_000],
+        "diagnostic": f"{type(error).__name__}: {error}"[:2_000],
+        "allowed_tables": list(tables[:50]),
+        "allowed_columns": [dict(column) for column in columns[:200]],
+    }
+
+
+def _validated_sql_artifact(
+    context: ToolContext,
+    *,
+    plan_id: str,
+    plan_version: int,
+    plan: DatasetPlan,
+    validated: ValidatedExtractionSql,
+    origin: str,
+    tables: list[str],
+    columns: list[dict[str, Any]],
+) -> Any:
+    existing = next(
+        (
+            artifact
+            for artifact in _store(context).list_artifacts(
+                kind="validated_sql"
+            )
+            if artifact.status == "approved"
+            and artifact.content.get("status") == "validated"
+            and artifact.content.get("plan_id") == plan_id
+            and artifact.content.get("plan_version") == plan_version
+            and artifact.content.get("sql_sha256") == validated.sha256
+            and artifact.content.get("sql") == validated.sql
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+
+    row_filters = _plan_row_filters(plan)
+    protected_columns = _plan_protected_columns(plan)
+    reference = _store(context).save_artifact(
+        kind="validated_sql",
+        status="approved",
+        content={
+            "status": "validated",
+            "origin": origin,
+            "sql": validated.sql,
+            "sql_sha256": validated.sha256,
+            "plan_id": plan_id,
+            "plan_version": plan_version,
+            "question": plan.goal,
+            "selection_id": plan_id,
+            "tables": list(tables),
+            "columns": [dict(column) for column in columns],
+            "operations": [
+                operation.model_dump(mode="json")
+                for operation in plan.operations
+            ],
+            "row_filters": row_filters,
+            "protected_columns": protected_columns,
+            "applied_filters": [],
+        },
+        provenance={
+            "study_id": require_context_study(context).study_id,
+            "thread_id": context.thread_id,
+            "producer": "dbrag-validate_and_extract",
+            "plan": {"id": plan_id, "version": plan_version},
+            "origin": origin,
+            "sql_sha256": validated.sha256,
+        },
+        summary=(
+            f"Validated SQL for dataset plan {plan_id} "
+            f"version {plan_version}"
+        ),
+    )
+    return _require_artifact(
+        context,
+        artifact_id=reference.id,
+        version=reference.version,
+        kind="validated_sql",
+    )
+
+
+def _validate_and_extract(
+    arguments: dict[str, Any],
+    context: ToolContext,
+) -> ToolResult:
+    plan_id = arguments["plan_id"]
+    plan_version = int(arguments["plan_version"])
+    stored_plan, plan = _approved_plan(
+        context,
+        plan_id=plan_id,
+        plan_version=plan_version,
+    )
+    columns = _plan_columns(plan)
+    reference_columns = _plan_reference_columns(plan)
+    tables = list(
+        dict.fromkeys(
+            str(column.get("table") or "").strip()
+            for column in reference_columns
+            if str(column.get("table") or "").strip()
+        )
+    )
+    runtime_path = _plan_runtime_path(context, plan)
+    supplied_sql = str(arguments.get("sql") or "").strip()
+    origin = "llm_repair" if supplied_sql else "deterministic_compiler"
+    attempted_sql: str | None = supplied_sql or None
+    try:
+        if attempted_sql is None:
+            attempted_sql = compile_dataset_plan_sql(plan)
+        validated = validate_extraction_sql(
+            sql=attempted_sql,
+            approved_tables=tables,
+            approved_columns=reference_columns,
+            database_path=runtime_path,
+        )
+    except (KeyError, ValueError) as error:
+        raise ToolExecutionError(
+            "SQL_REPAIR_REQUIRED",
+            (
+                "The SQL candidate requires technical repair against the "
+                "frozen approved plan."
+            ),
+            recoverable=True,
+            details=_sql_repair_details(
+                plan_id=plan_id,
+                plan_version=plan_version,
+                origin=origin,
+                stage="validation",
+                attempted_sql=attempted_sql,
+                error=error,
+                tables=tables,
+                columns=reference_columns,
+            ),
+        ) from error
+    sql_artifact = _validated_sql_artifact(
+        context,
+        plan_id=plan_id,
+        plan_version=plan_version,
+        plan=plan,
+        validated=validated,
+        origin=origin,
+        tables=tables,
+        columns=columns,
+    )
+    result = _persist_extraction_result(
+        arguments,
+        context,
+        stored_plan=stored_plan,
+        plan=plan,
+        sql_artifact=sql_artifact,
+        validated=validated,
+        execution=None,
+    )
+    sql_reference = ArtifactRef(
+        id=sql_artifact.id,
+        kind=sql_artifact.kind,
+        version=sql_artifact.version,
+    )
+    return ToolResult(
+        message=result.message,
+        artifacts=(*result.artifacts, sql_reference),
+        terminal_control=result.terminal_control,
+    )
+
+
+def _replacement_predecessor(
+    arguments: dict[str, Any],
+    context: ToolContext,
+    *,
+    plan_id: str,
+    plan_version: int,
+) -> tuple[Any, ArtifactRef] | None:
+    predecessor_id = arguments.get("predecessor_dataset_id")
+    predecessor_version = arguments.get("predecessor_dataset_version")
+    if (predecessor_id is None) != (predecessor_version is None):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENTS",
+            (
+                "predecessor_dataset_id and predecessor_dataset_version "
+                "must be provided together."
+            ),
+            recoverable=True,
+        )
+    if predecessor_id is None:
+        return None
+    predecessor = _require_artifact(
+        context,
+        artifact_id=str(predecessor_id),
+        version=int(predecessor_version),
+    )
+    if predecessor.kind not in _DATASET_KINDS:
+        raise ToolExecutionError(
+            "PREDECESSOR_NOT_DATASET",
+            "Replacement predecessor must be an extracted dataset.",
+            recoverable=True,
+        )
+    if predecessor.status != "pending_review":
+        raise ToolExecutionError(
+            "PREDECESSOR_NOT_PENDING_REVIEW",
+            "Replacement requires an exact pending-review predecessor dataset.",
+            recoverable=True,
+        )
+    predecessor_provenance = dict(
+        predecessor.content.get("provenance") or {}
+    )
+    if (
+        predecessor_provenance.get("plan_id") != plan_id
+        or predecessor_provenance.get("plan_version") != plan_version
+    ):
+        raise ToolExecutionError(
+            "PREDECESSOR_PLAN_MISMATCH",
+            "Predecessor dataset does not belong to the exact approved plan.",
+            recoverable=True,
+        )
+    list_artifacts = getattr(context.artifact_store, "list_artifacts", None)
+    if not callable(list_artifacts):
+        raise ToolExecutionError(
+            "ARTIFACT_STORE_UNAVAILABLE",
+            "The artifact store cannot inspect dataset feedback lineage.",
+            recoverable=False,
+        )
+    feedback = next(
+        (
+            artifact
+            for artifact in reversed(
+                list(list_artifacts(kind="dataset_review_feedback"))
+            )
+            if artifact.content.get("action") == "revise"
+            and artifact.content.get("dataset_id") == predecessor.id
+            and artifact.content.get("dataset_version") == predecessor.version
+            and artifact.content.get("plan_id") == plan_id
+            and artifact.content.get("plan_version") == plan_version
+            and artifact.content.get("sql_id")
+            == predecessor_provenance.get("sql_id")
+            and artifact.content.get("sql_version")
+            == predecessor_provenance.get("sql_version")
+            and artifact.status == "active"
+        ),
+        None,
+    )
+    if feedback is None:
+        raise ToolExecutionError(
+            "PREDECESSOR_FEEDBACK_REQUIRED",
+            "Replacement requires matching human feedback for the predecessor.",
+            recoverable=True,
+        )
+    return predecessor, ArtifactRef(
+        id=feedback.id,
+        kind=feedback.kind,
+        version=feedback.version,
+    )
+
+
+def _predecessor_identity(
+    arguments: dict[str, Any],
+) -> tuple[str, int] | None:
+    predecessor_id = arguments.get("predecessor_dataset_id")
+    predecessor_version = arguments.get("predecessor_dataset_version")
+    if (predecessor_id is None) != (predecessor_version is None):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENTS",
+            (
+                "predecessor_dataset_id and predecessor_dataset_version "
+                "must be provided together."
+            ),
+            recoverable=True,
+        )
+    if predecessor_id is None:
+        return None
+    return str(predecessor_id), int(predecessor_version)
+
+
+def _deterministic_agent_dataset_id(
+    *,
+    thread_id: str,
+    plan_id: str,
+    plan_version: int,
+    sql_id: str,
+    sql_version: int,
+    predecessor: tuple[str, int] | None,
+) -> str:
+    identity = {
+        "thread_id": thread_id,
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "sql_id": sql_id,
+        "sql_version": sql_version,
+        "predecessor_dataset_id": predecessor[0] if predecessor else None,
+        "predecessor_dataset_version": predecessor[1] if predecessor else None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"subset-agent-{digest[:20]}"
+
+
+def _canonical_content_sha256(content: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        content,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validated_sql_output_aliases(sql: str) -> list[str]:
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        expression = sqlglot.parse_one(sql, dialect="duckdb")
+        select = (
+            expression
+            if isinstance(expression, exp.Select)
+            else expression.find(exp.Select)
+        )
+        aliases = [
+            str(projection.alias_or_name or "").strip()
+            for projection in list(select.expressions if select else [])
+        ]
+    except Exception as error:
+        raise ToolExecutionError(
+            "SQL_NOT_VALIDATED",
+            "Validated SQL artifact has an unreadable projection contract.",
+            recoverable=False,
+        ) from error
+    if not aliases or any(not alias for alias in aliases):
+        raise ToolExecutionError(
+            "SQL_NOT_VALIDATED",
+            "Validated SQL artifact has an incomplete projection contract.",
+            recoverable=False,
+        )
+    return aliases
+
+
+def _dataset_persistence_lineage(
+    context: ToolContext,
+    *,
+    plan_id: str,
+    plan_version: int,
+    plan_content: dict[str, Any],
+    sql_id: str,
+    sql_version: int,
+    sql_content: dict[str, Any],
+    expected_output_aliases: list[str],
+    approved_selected_tables: list[str],
+    approved_selected_columns: list[dict[str, Any]],
+    predecessor: tuple[str, int] | None,
+) -> dict[str, Any]:
+    return {
+        "thread_id": context.thread_id,
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "plan_content_sha256": _canonical_content_sha256(plan_content),
+        "sql_id": sql_id,
+        "sql_version": sql_version,
+        "sql_content_sha256": _canonical_content_sha256(sql_content),
+        "expected_output_aliases": list(expected_output_aliases),
+        "approved_selected_tables": list(approved_selected_tables),
+        "approved_selected_columns": [
+            dict(column) for column in approved_selected_columns
+        ],
+        "predecessor_dataset_id": predecessor[0] if predecessor else None,
+        "predecessor_dataset_version": predecessor[1] if predecessor else None,
+    }
+
+
+def _dataset_result(
+    dataset: Any,
+    *,
+    reused: bool,
+    replacement: dict[str, Any] | None,
+) -> ToolResult:
+    reference = ArtifactRef(
+        id=dataset.id,
+        kind=dataset.kind,
+        version=dataset.version,
+    )
+    suffix = " reused=true." if reused else "."
+    if replacement:
+        suffix = (
+            f" predecessor_dataset_id={replacement['predecessor_id']} "
+            f"predecessor_status=superseded reused={str(reused).lower()}."
+        )
+    return ToolResult(
+        message=(
+            f"{'Reused' if reused else 'Executed'} validated SQL "
+            f"dataset_id={dataset.id} version={dataset.version} "
+            f"status=pending_review rows={dataset.content.get('row_count', 0)} "
+            f"columns={dataset.content.get('column_count', 0)}{suffix}"
+        ),
+        artifacts=(reference,),
+    )
+
+
+def _persistence_store_methods(context: ToolContext) -> dict[str, Callable[..., Any]]:
+    methods = {
+        name: getattr(context.artifact_store, name, None)
+        for name in (
+            "get_dataset_persistence_attempt",
+            "begin_dataset_persistence_attempt",
+            "advance_dataset_persistence_attempt",
+            "commit_dataset_persistence_attempt",
+        )
+    }
+    if not all(callable(method) for method in methods.values()):
+        raise ToolExecutionError(
+            "ARTIFACT_STORE_UNAVAILABLE",
+            "The artifact store does not support durable dataset persistence attempts.",
+            recoverable=False,
+        )
+    return methods  # type: ignore[return-value]
+
+
+def _replacement_control(
+    replacement: tuple[Any, ArtifactRef] | None,
+) -> dict[str, Any] | None:
+    if replacement is None:
+        return None
+    predecessor, feedback = replacement
+    return {
+        "predecessor_id": predecessor.id,
+        "predecessor_kind": predecessor.kind,
+        "predecessor_version": predecessor.version,
+        "feedback_id": feedback.id,
+        "feedback_kind": feedback.kind,
+        "feedback_version": feedback.version,
+    }
+
+
+def _attempt_commit_references(
+    attempt: dict[str, Any],
+) -> tuple[ArtifactRef | None, ArtifactRef | None]:
+    replacement = attempt.get("replacement")
+    if not isinstance(replacement, dict):
+        return None, None
+    return (
+        ArtifactRef(
+            id=str(replacement["predecessor_id"]),
+            kind=str(replacement["predecessor_kind"]),
+            version=int(replacement["predecessor_version"]),
+        ),
+        ArtifactRef(
+            id=str(replacement["feedback_id"]),
+            kind=str(replacement["feedback_kind"]),
+            version=int(replacement["feedback_version"]),
+        ),
+    )
+
+
+def _verify_attempt_final_files(attempt: dict[str, Any]) -> None:
+    try:
+        verify_dataset_artifact_manifest(
+            paths=dict(attempt.get("expected_final_paths") or {}),
+            manifest=dict(attempt.get("manifest") or {}),
+        )
+    except ValueError as error:
+        raise ToolExecutionError(
+            "DATASET_DURABLE_COLLISION",
+            str(error),
+            recoverable=False,
+        ) from error
+    except OSError as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            f"Durable manifest could not be read: {type(error).__name__}.",
+            recoverable=True,
+        ) from error
+
+
+def _durable_collision(message: str) -> ToolExecutionError:
+    return ToolExecutionError(
+        "DATASET_DURABLE_COLLISION",
+        message,
+        recoverable=False,
+    )
+
+
+def _validate_attempt_replacement_control(
+    context: ToolContext,
+    *,
+    attempt: dict[str, Any],
+    lineage: dict[str, Any],
+) -> None:
+    predecessor_id = lineage.get("predecessor_dataset_id")
+    predecessor_version = lineage.get("predecessor_dataset_version")
+    replacement = attempt.get("replacement")
+    if predecessor_id is None and predecessor_version is None:
+        if replacement is not None:
+            raise _durable_collision(
+                "Ordinary dataset persistence has replacement control."
+            )
+        return
+    if predecessor_id is None or predecessor_version is None:
+        raise _durable_collision(
+            "Replacement dataset lineage has an incomplete predecessor."
+        )
+    if not isinstance(replacement, dict) or (
+        replacement.get("predecessor_id") != predecessor_id
+        or replacement.get("predecessor_version") != predecessor_version
+    ):
+        raise _durable_collision(
+            "Replacement control does not match predecessor lineage."
+        )
+    try:
+        predecessor = context.artifact_store.require(
+            ArtifactRef(
+                id=str(replacement["predecessor_id"]),
+                kind=str(replacement["predecessor_kind"]),
+                version=int(replacement["predecessor_version"]),
+            )
+        )
+        feedback = context.artifact_store.require(
+            ArtifactRef(
+                id=str(replacement["feedback_id"]),
+                kind=str(replacement["feedback_kind"]),
+                version=int(replacement["feedback_version"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise _durable_collision(
+            "Replacement control references unavailable artifacts."
+        ) from error
+    predecessor_provenance = dict(
+        predecessor.content.get("provenance") or {}
+    )
+    feedback_content = dict(feedback.content)
+    if (
+        predecessor.id != predecessor_id
+        or predecessor.version != predecessor_version
+        or predecessor.kind != replacement.get("predecessor_kind")
+        or predecessor.status not in {"pending_review", "superseded"}
+        or predecessor_provenance.get("plan_id") != lineage.get("plan_id")
+        or predecessor_provenance.get("plan_version")
+        != lineage.get("plan_version")
+        or feedback.id != replacement.get("feedback_id")
+        or feedback.version != replacement.get("feedback_version")
+        or feedback.kind != "dataset_review_feedback"
+        or feedback.kind != replacement.get("feedback_kind")
+        or feedback.status != "active"
+        or feedback_content.get("action") != "revise"
+        or not str(feedback_content.get("feedback") or "").strip()
+        or feedback_content.get("dataset_id") != predecessor.id
+        or feedback_content.get("dataset_version") != predecessor.version
+        or feedback_content.get("plan_id") != lineage.get("plan_id")
+        or feedback_content.get("plan_version") != lineage.get("plan_version")
+        or feedback_content.get("sql_id")
+        != predecessor_provenance.get("sql_id")
+        or feedback_content.get("sql_version")
+        != predecessor_provenance.get("sql_version")
+    ):
+        raise _durable_collision(
+            "Replacement predecessor or feedback lineage is inconsistent."
+        )
+
+
+def _validate_canonical_dataset_lineage(
+    artifact: dict[str, Any],
+    *,
+    lineage: dict[str, Any],
+    validated_sql: str,
+) -> None:
+    provenance = dict(artifact.get("provenance") or {})
+    expected = {
+        "thread_id": lineage.get("thread_id"),
+        "plan_id": lineage.get("plan_id"),
+        "plan_version": lineage.get("plan_version"),
+        "sql_id": lineage.get("sql_id"),
+        "sql_version": lineage.get("sql_version"),
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise _durable_collision(
+            "Canonical dataset provenance does not match persistence lineage."
+        )
+    if (
+        provenance.get("selection_artifact_id") != lineage.get("plan_id")
+        or provenance.get("sql_candidate_artifact_id")
+        != lineage.get("sql_id")
+    ):
+        raise _durable_collision(
+            "Canonical dataset artifact references do not match lineage."
+        )
+    if provenance.get("sql") != validated_sql:
+        raise _durable_collision(
+            "Canonical dataset SQL does not match the validated SQL artifact."
+        )
+    expected_tables = list(lineage.get("approved_selected_tables") or [])
+    expected_columns = list(
+        lineage.get("approved_selected_columns") or []
+    )
+    if (
+        provenance.get("source_tables") != expected_tables
+        or provenance.get("selected_tables") != expected_tables
+        or provenance.get("selected_columns") != expected_columns
+    ):
+        raise _durable_collision(
+            "Canonical dataset selected fields do not match the approved plan."
+        )
+    if artifact.get("columns") != list(
+        lineage.get("expected_output_aliases") or []
+    ):
+        raise _durable_collision(
+            "Canonical dataset output columns do not match validated SQL aliases."
+        )
+    predecessor_id = lineage.get("predecessor_dataset_id")
+    predecessor_version = lineage.get("predecessor_dataset_version")
+    if predecessor_id is None and predecessor_version is None:
+        if (
+            "predecessor_dataset_id" in provenance
+            or "predecessor_dataset_version" in provenance
+        ):
+            raise _durable_collision(
+                "Ordinary dataset metadata contains predecessor lineage."
+            )
+    elif (
+        provenance.get("predecessor_dataset_id") != predecessor_id
+        or provenance.get("predecessor_dataset_version")
+        != predecessor_version
+    ):
+        raise _durable_collision(
+            "Canonical dataset predecessor does not match persistence lineage."
+        )
+
+
+def _verify_canonical_attempt_dataset(
+    context: ToolContext,
+    *,
+    attempt: dict[str, Any],
+    lineage: dict[str, Any],
+    validated_sql: str,
+    runtime_root: Any,
+) -> dict[str, Any]:
+    try:
+        canonical = load_verified_dataset_artifact(
+            runtime_root=runtime_root,
+            thread_id=context.thread_id,
+            dataset_id=str(attempt["dataset_id"]),
+            paths=dict(attempt.get("expected_final_paths") or {}),
+            manifest=dict(attempt.get("manifest") or {}),
+            expected_kind="subset",
+            expected_version=1,
+            expected_status="pending_review",
+        )
+    except (OSError, ValueError) as error:
+        raise _durable_collision(str(error)) from error
+    if canonical != dict(attempt.get("dataset") or {}):
+        raise _durable_collision(
+            "Persistence journal dataset snapshot does not match canonical metadata."
+        )
+    _validate_canonical_dataset_lineage(
+        canonical,
+        lineage=lineage,
+        validated_sql=validated_sql,
+    )
+    _validate_attempt_replacement_control(
+        context,
+        attempt=attempt,
+        lineage=lineage,
+    )
+    return {**attempt, "dataset": canonical}
+
+
+def _write_attempt_journal(
+    context: ToolContext,
+    *,
+    runtime_root: Any,
+    attempt: dict[str, Any],
+) -> None:
+    try:
+        write_dataset_persistence_journal(
+            runtime_root=runtime_root,
+            thread_id=context.thread_id,
+            dataset_id=str(attempt["dataset_id"]),
+            attempt=attempt,
+        )
+    except ValueError as error:
+        raise ToolExecutionError(
+            "DATASET_DURABLE_COLLISION",
+            str(error),
+            recoverable=False,
+        ) from error
+    except OSError as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            f"Persistence journal could not be written: {type(error).__name__}.",
+            recoverable=True,
+        ) from error
+
+
+def _load_attempt_journal(
+    context: ToolContext,
+    *,
+    runtime_root: Any,
+    dataset_id: str,
+) -> dict[str, Any] | None:
+    try:
+        return load_dataset_persistence_journal(
+            runtime_root=runtime_root,
+            thread_id=context.thread_id,
+            dataset_id=dataset_id,
+        )
+    except ValueError as error:
+        raise ToolExecutionError(
+            "DATASET_DURABLE_COLLISION",
+            str(error),
+            recoverable=False,
+        ) from error
+    except OSError as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            f"Persistence journal could not be read: {type(error).__name__}.",
+            recoverable=True,
+        ) from error
+
+
+def _attempt_base(attempt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: attempt[key]
+        for key in (
+            "dataset_id",
+            "state",
+            "lineage",
+            "expected_final_paths",
+            "expected_staging_paths",
+            "replacement",
+        )
+        if key in attempt
+    }
+
+
+def _require_attempt_identity(
+    attempt: dict[str, Any],
+    *,
+    lineage: dict[str, Any],
+    expected_final_paths: dict[str, str],
+    expected_staging_paths: dict[str, str],
+) -> None:
+    if (
+        dict(attempt.get("lineage") or {}) != lineage
+        or dict(attempt.get("expected_final_paths") or {}) != expected_final_paths
+        or dict(attempt.get("expected_staging_paths") or {})
+        != expected_staging_paths
+    ):
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Dataset persistence attempt lineage or storage paths do not match.",
+            recoverable=False,
+        )
+
+
+def _sync_attempt_from_journal(
+    context: ToolContext,
+    *,
+    methods: dict[str, Callable[..., Any]],
+    attempt: dict[str, Any] | None,
+    journal: dict[str, Any],
+    runtime_root: Any,
+) -> dict[str, Any]:
+    dataset_id = str(journal["dataset_id"])
+    journal_base = _attempt_base(journal)
+    journal_base["state"] = "begun"
+    if attempt is None:
+        attempt = methods["begin_dataset_persistence_attempt"](journal_base)
+    elif _attempt_base({**attempt, "state": "begun"}) != journal_base:
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Graph persistence attempt does not match its durable journal.",
+            recoverable=False,
+        )
+
+    rank = {"begun": 0, "staged": 1, "promoted": 2, "committed": 3}
+    graph_state = str(attempt.get("state") or "")
+    journal_state = str(journal.get("state") or "")
+    if graph_state not in rank or journal_state not in rank:
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Persistence attempt or journal has an unknown state.",
+            recoverable=False,
+        )
+
+    if rank[graph_state] > rank[journal_state]:
+        expected = {**journal, "state": graph_state}
+        if graph_state in {"staged", "promoted", "committed"}:
+            expected["manifest"] = attempt.get("manifest")
+            expected["dataset"] = attempt.get("dataset")
+        if attempt != expected:
+            raise ToolExecutionError(
+                "DATASET_IDENTITY_COLLISION",
+                "Graph persistence attempt is incompatible with its durable journal.",
+                recoverable=False,
+            )
+        _write_attempt_journal(
+            context,
+            runtime_root=runtime_root,
+            attempt=attempt,
+        )
+        return attempt
+
+    if rank[journal_state] >= rank["staged"] and graph_state == "begun":
+        attempt = methods["advance_dataset_persistence_attempt"](
+            dataset_id,
+            lineage=dict(journal["lineage"]),
+            expected_state="begun",
+            state="staged",
+            manifest=dict(journal["manifest"]),
+            dataset=dict(journal["dataset"]),
+        )
+        graph_state = "staged"
+    if rank[journal_state] >= rank["promoted"] and graph_state == "staged":
+        attempt = methods["advance_dataset_persistence_attempt"](
+            dataset_id,
+            lineage=dict(journal["lineage"]),
+            expected_state="staged",
+            state="promoted",
+        )
+        graph_state = "promoted"
+
+    if journal_state == "committed" and graph_state == "promoted":
+        return attempt
+    if attempt != journal:
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Graph persistence attempt state does not match its durable journal.",
+            recoverable=False,
+        )
+    return attempt
+
+
+def _prepare_journal_for_hydration(
+    context: ToolContext,
+    *,
+    journal: dict[str, Any],
+    lineage: dict[str, Any],
+    validated_sql: str,
+    expected_final_paths: dict[str, str],
+    expected_staging_paths: dict[str, str],
+    runtime_root: Any,
+) -> dict[str, Any]:
+    _validate_attempt_replacement_control(
+        context,
+        attempt=journal,
+        lineage=lineage,
+    )
+    state = str(journal.get("state") or "")
+    if state == "begun":
+        return journal
+    if state == "staged":
+        try:
+            promote_staged_dataset_artifact(
+                runtime_root=runtime_root,
+                thread_id=context.thread_id,
+                dataset_id=str(journal["dataset_id"]),
+                expected_final_paths=expected_final_paths,
+                expected_staging_paths=expected_staging_paths,
+                manifest=dict(journal.get("manifest") or {}),
+            )
+        except ValueError as error:
+            raise _durable_collision(str(error)) from error
+        except OSError as error:
+            raise ToolExecutionError(
+                "DATASET_PERSISTENCE_PENDING",
+                f"Staged promotion could not complete: {type(error).__name__}.",
+                recoverable=True,
+            ) from error
+        promoted = _verify_canonical_attempt_dataset(
+            context,
+            attempt={**journal, "state": "promoted"},
+            lineage=lineage,
+            validated_sql=validated_sql,
+            runtime_root=runtime_root,
+        )
+        _write_attempt_journal(
+            context,
+            runtime_root=runtime_root,
+            attempt=promoted,
+        )
+        return promoted
+    return _verify_canonical_attempt_dataset(
+        context,
+        attempt=journal,
+        lineage=lineage,
+        validated_sql=validated_sql,
+        runtime_root=runtime_root,
+    )
+
+
+def _committed_attempt_result(
+    context: ToolContext,
+    *,
+    attempt: dict[str, Any],
+    reused: bool,
+) -> ToolResult:
+    if attempt.get("state") != "committed":
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Dataset persistence attempt is not committed.",
+            recoverable=False,
+        )
+    _verify_attempt_final_files(attempt)
+    try:
+        dataset = context.artifact_store.require(str(attempt["dataset_id"]))
+    except KeyError as error:
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Committed persistence attempt has no registered dataset.",
+            recoverable=False,
+        ) from error
+    if (
+        dataset.content != dict(attempt.get("dataset") or {})
+        or dataset.status != "pending_review"
+    ):
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Committed dataset registry does not match its persistence attempt.",
+            recoverable=False,
+        )
+    replacement = attempt.get("replacement")
+    if isinstance(replacement, dict):
+        predecessor = context.artifact_store.require(
+            ArtifactRef(
+                id=str(replacement["predecessor_id"]),
+                kind=str(replacement["predecessor_kind"]),
+                version=int(replacement["predecessor_version"]),
+            )
+        )
+        if predecessor.status != "superseded":
+            raise ToolExecutionError(
+                "DATASET_IDENTITY_COLLISION",
+                "Committed replacement did not supersede its predecessor.",
+                recoverable=False,
+            )
+    return _dataset_result(
+        dataset,
+        reused=reused,
+        replacement=replacement if isinstance(replacement, dict) else None,
+    )
+
+
+def _commit_persistence_attempt(
+    context: ToolContext,
+    *,
+    methods: dict[str, Callable[..., Any]],
+    attempt: dict[str, Any],
+    plan_id: str,
+    plan_version: int,
+    reused: bool,
+    runtime_root: Any,
+) -> ToolResult:
+    predecessor_ref, feedback_ref = _attempt_commit_references(attempt)
+    try:
+        methods["commit_dataset_persistence_attempt"](
+            str(attempt["dataset_id"]),
+            lineage=dict(attempt["lineage"]),
+            artifact=dict(attempt["dataset"]),
+            plan_ref=ArtifactRef(
+                id=plan_id,
+                kind="dataset_plan",
+                version=plan_version,
+            ),
+            predecessor_ref=predecessor_ref,
+            feedback_ref=feedback_ref,
+            provenance={
+                "actor": "dbrag-validate_and_extract",
+                "thread_id": context.thread_id,
+            },
+        )
+    except Exception as error:
+        refreshed = methods["get_dataset_persistence_attempt"](
+            str(attempt["dataset_id"])
+        )
+        if isinstance(refreshed, dict) and refreshed.get("state") == "committed":
+            expected_committed = {**attempt, "state": "committed"}
+            if refreshed != expected_committed:
+                raise ToolExecutionError(
+                    "DATASET_IDENTITY_COLLISION",
+                    "Committed persistence response has mismatched attempt metadata.",
+                    recoverable=False,
+                ) from error
+            _write_attempt_journal(
+                context,
+                runtime_root=runtime_root,
+                attempt=refreshed,
+            )
+            return _committed_attempt_result(
+                context,
+                attempt=refreshed,
+                reused=reused,
+            )
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            (
+                f"Dataset persistence is tracked but not committed after "
+                f"{type(error).__name__}; replay the exact tool call."
+            ),
+            recoverable=True,
+        ) from error
+    committed = methods["get_dataset_persistence_attempt"](
+        str(attempt["dataset_id"])
+    )
+    if not isinstance(committed, dict) or committed.get("state") != "committed":
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            "Dataset commit response did not include a committed persistence attempt.",
+            recoverable=True,
+        )
+    if committed != {**attempt, "state": "committed"}:
+        raise ToolExecutionError(
+            "DATASET_IDENTITY_COLLISION",
+            "Committed persistence attempt metadata changed unexpectedly.",
+            recoverable=False,
+        )
+    _write_attempt_journal(
+        context,
+        runtime_root=runtime_root,
+        attempt=committed,
+    )
+    return _committed_attempt_result(
+        context,
+        attempt=committed,
+        reused=reused,
+    )
+
+
+def _reconcile_persistence_attempt(
+    context: ToolContext,
+    *,
+    methods: dict[str, Callable[..., Any]],
+    attempt: dict[str, Any],
+    lineage: dict[str, Any],
+    validated_sql: str,
+    expected_final_paths: dict[str, str],
+    expected_staging_paths: dict[str, str],
+    runtime_root: Any,
+    plan_id: str,
+    plan_version: int,
+) -> ToolResult | None:
+    _require_attempt_identity(
+        attempt,
+        lineage=lineage,
+        expected_final_paths=expected_final_paths,
+        expected_staging_paths=expected_staging_paths,
+    )
+    _validate_attempt_replacement_control(
+        context,
+        attempt=attempt,
+        lineage=lineage,
+    )
+    state = str(attempt.get("state") or "")
+    if state == "committed":
+        attempt = _verify_canonical_attempt_dataset(
+            context,
+            attempt=attempt,
+            lineage=lineage,
+            validated_sql=validated_sql,
+            runtime_root=runtime_root,
+        )
+        return _committed_attempt_result(
+            context,
+            attempt=attempt,
+            reused=True,
+        )
+    if state == "promoted":
+        attempt = _verify_canonical_attempt_dataset(
+            context,
+            attempt=attempt,
+            lineage=lineage,
+            validated_sql=validated_sql,
+            runtime_root=runtime_root,
+        )
+        return _commit_persistence_attempt(
+            context,
+            methods=methods,
+            attempt=attempt,
+            plan_id=plan_id,
+            plan_version=plan_version,
+            reused=True,
+            runtime_root=runtime_root,
+        )
+    if state == "staged":
+        try:
+            promote_staged_dataset_artifact(
+                runtime_root=runtime_root,
+                thread_id=context.thread_id,
+                dataset_id=str(attempt["dataset_id"]),
+                expected_final_paths=expected_final_paths,
+                expected_staging_paths=expected_staging_paths,
+                manifest=dict(attempt.get("manifest") or {}),
+            )
+        except ValueError as error:
+            raise ToolExecutionError(
+                "DATASET_DURABLE_COLLISION",
+                str(error),
+                recoverable=False,
+            ) from error
+        except OSError as error:
+            raise ToolExecutionError(
+                "DATASET_PERSISTENCE_PENDING",
+                f"Staged promotion could not complete: {type(error).__name__}.",
+                recoverable=True,
+            ) from error
+        promoted_attempt = {**attempt, "state": "promoted"}
+        promoted_attempt = _verify_canonical_attempt_dataset(
+            context,
+            attempt=promoted_attempt,
+            lineage=lineage,
+            validated_sql=validated_sql,
+            runtime_root=runtime_root,
+        )
+        _write_attempt_journal(
+            context,
+            runtime_root=runtime_root,
+            attempt=promoted_attempt,
+        )
+        try:
+            attempt = methods["advance_dataset_persistence_attempt"](
+                str(attempt["dataset_id"]),
+                lineage=lineage,
+                expected_state="staged",
+                state="promoted",
+            )
+        except Exception as error:
+            raise ToolExecutionError(
+                "DATASET_PERSISTENCE_PENDING",
+                (
+                    f"Promoted dataset remains tracked after "
+                    f"{type(error).__name__}; replay the exact tool call."
+                ),
+                recoverable=True,
+            ) from error
+        return _commit_persistence_attempt(
+            context,
+            methods=methods,
+            attempt=attempt,
+            plan_id=plan_id,
+            plan_version=plan_version,
+            reused=True,
+            runtime_root=runtime_root,
+        )
+    if state == "begun":
+        if any(Path(path).exists() for path in expected_final_paths.values()):
+            raise ToolExecutionError(
+                "DATASET_DURABLE_COLLISION",
+                "Begun persistence attempt has unverified final files.",
+                recoverable=False,
+            )
+        cleanup_dataset_staging(
+            runtime_root=runtime_root,
+            thread_id=context.thread_id,
+            dataset_id=str(attempt["dataset_id"]),
+            expected_staging_paths={
+                "root": str(
+                    generated_dataset_staging_paths(
+                        runtime_root=runtime_root,
+                        thread_id=context.thread_id,
+                        dataset_id=str(attempt["dataset_id"]),
+                    )["root"]
+                ),
+                **expected_staging_paths,
+            },
+        )
+        return None
+    raise ToolExecutionError(
+        "DATASET_IDENTITY_COLLISION",
+        f"Unknown dataset persistence attempt state: {state or '<missing>'}.",
+        recoverable=False,
+    )
+
+
+def _persist_extraction_result(
+    arguments: dict[str, Any],
+    context: ToolContext,
+    *,
+    stored_plan: Any,
+    plan: DatasetPlan,
+    sql_artifact: Any,
+    validated: ValidatedExtractionSql,
+    execution: SqlExecutionResult | None,
+) -> ToolResult:
+    plan_id = arguments["plan_id"]
+    plan_version = int(arguments["plan_version"])
+    predecessor_identity = _predecessor_identity(arguments)
+    sql_content = dict(sql_artifact.content)
+    dataset_id = _deterministic_agent_dataset_id(
+        thread_id=context.thread_id,
+        plan_id=plan_id,
+        plan_version=plan_version,
+        sql_id=sql_artifact.id,
+        sql_version=sql_artifact.version,
+        predecessor=predecessor_identity,
+    )
+    from graph.state import MetaKeys
+
+    columns = _plan_columns(plan)
+    tables = [str(table) for table in list(sql_content.get("tables") or [])]
+    validated_sql = validated.sql
+    candidate = PreparedSqlCandidate(
+        question=plan.goal,
+        sql=validated.sql,
+        tables=tables,
+        columns=columns,
+        selection_id=plan_id,
+        row_filters=_plan_row_filters(plan),
+        protected_columns=_plan_protected_columns(plan),
+        applied_filters=[],
+    )
+    expected_output_aliases = _validated_sql_output_aliases(candidate.sql)
+    approved_selected_columns = db_rag_persistence.serialize_columns(
+        candidate.columns
+    )
+    methods = _persistence_store_methods(context)
+    lineage = _dataset_persistence_lineage(
+        context,
+        plan_id=plan_id,
+        plan_version=plan_version,
+        plan_content=dict(stored_plan.content),
+        sql_id=sql_artifact.id,
+        sql_version=sql_artifact.version,
+        sql_content=sql_content,
+        expected_output_aliases=expected_output_aliases,
+        approved_selected_tables=candidate.tables,
+        approved_selected_columns=approved_selected_columns,
+        predecessor=predecessor_identity,
+    )
+    runtime_root = db_rag_persistence.DEFAULT_RUNTIME_ROOT
+    final_paths = generated_dataset_artifact_paths(
+        runtime_root=runtime_root,
+        thread_id=context.thread_id,
+        dataset_id=dataset_id,
+    )
+    staging_paths = generated_dataset_staging_paths(
+        runtime_root=runtime_root,
+        thread_id=context.thread_id,
+        dataset_id=dataset_id,
+    )
+    expected_final_paths = {
+        key: str(final_paths[key])
+        for key in ("path", "schema_path", "metadata_path")
+    }
+    expected_staging_paths = {
+        key: str(staging_paths[key])
+        for key in ("path", "schema_path", "metadata_path")
+    }
+    attempt = methods["get_dataset_persistence_attempt"](dataset_id)
+    journal = _load_attempt_journal(
+        context,
+        runtime_root=runtime_root,
+        dataset_id=dataset_id,
+    )
+    if journal is not None:
+        _require_attempt_identity(
+            journal,
+            lineage=lineage,
+            expected_final_paths=expected_final_paths,
+            expected_staging_paths=expected_staging_paths,
+        )
+        journal = _prepare_journal_for_hydration(
+            context,
+            journal=journal,
+            lineage=lineage,
+            validated_sql=validated_sql,
+            expected_final_paths=expected_final_paths,
+            expected_staging_paths=expected_staging_paths,
+            runtime_root=runtime_root,
+        )
+        try:
+            attempt = _sync_attempt_from_journal(
+                context,
+                methods=methods,
+                attempt=attempt if isinstance(attempt, dict) else None,
+                journal=journal,
+                runtime_root=runtime_root,
+            )
+        except ToolExecutionError:
+            raise
+        except Exception as error:
+            raise ToolExecutionError(
+                "DATASET_IDENTITY_COLLISION",
+                f"Persistence journal hydration failed: {type(error).__name__}.",
+                recoverable=False,
+            ) from error
+    elif isinstance(attempt, dict):
+        _write_attempt_journal(
+            context,
+            runtime_root=runtime_root,
+            attempt=attempt,
+        )
+    replacement: tuple[Any, ArtifactRef] | None = None
+    replacement_control: dict[str, Any] | None = None
+    if isinstance(attempt, dict):
+        reconciled = _reconcile_persistence_attempt(
+            context,
+            methods=methods,
+            attempt=attempt,
+            lineage=lineage,
+            validated_sql=validated_sql,
+            expected_final_paths=expected_final_paths,
+            expected_staging_paths=expected_staging_paths,
+            runtime_root=runtime_root,
+            plan_id=plan_id,
+            plan_version=plan_version,
+        )
+        if reconciled is not None:
+            return reconciled
+        replacement_control = (
+            dict(attempt["replacement"])
+            if isinstance(attempt.get("replacement"), dict)
+            else None
+        )
+    else:
+        try:
+            context.artifact_store.require(dataset_id)
+        except KeyError:
+            pass
+        else:
+            raise ToolExecutionError(
+                "DATASET_IDENTITY_COLLISION",
+                "Deterministic dataset exists without a persistence attempt.",
+                recoverable=False,
+            )
+        replacement = _replacement_predecessor(
+            arguments,
+            context,
+            plan_id=plan_id,
+            plan_version=plan_version,
+        )
+        replacement_control = _replacement_control(replacement)
+    if execution is None:
+        try:
+            execution = execute_validated_extraction_sql(
+                validated,
+                source_tables=tables,
+                database_path=_plan_runtime_path(context, plan),
+            )
+        except Exception as error:
+            raise ToolExecutionError(
+                "SQL_REPAIR_REQUIRED",
+                (
+                    "The validated SQL candidate failed during read-only "
+                    "execution."
+                ),
+                recoverable=True,
+                details=_sql_repair_details(
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    origin=str(sql_content.get("origin") or ""),
+                    stage="execution",
+                    attempted_sql=validated.sql,
+                    error=error,
+                    tables=tables,
+                    columns=_plan_reference_columns(plan),
+                ),
+            ) from error
+    relationship_metrics = _plan_relationship_metrics(
+        context,
+        plan,
+    )
+    grain_columns = [
+        str(field.output_column or field.column).strip()
+        for field in [
+            *plan.required_fields,
+            *[
+                field
+                for concept in plan.concepts
+                for field in concept.fields
+                if "grain" in field.roles
+                or field.purpose.strip().casefold() in {"grain", "timing"}
+            ],
+        ]
+    ]
+    approved_selection = {
+        "selection_id": plan_id,
+        "source_question": plan.goal,
+        "goal_text": plan.goal,
+        "tables": candidate.tables,
+        "columns": approved_selected_columns,
+        "row_filters": candidate.row_filters,
+        "protected_columns": candidate.protected_columns,
+    }
+    if attempt is None:
+        attempt_record = {
+            "dataset_id": dataset_id,
+            "state": "begun",
+            "lineage": lineage,
+            "expected_final_paths": expected_final_paths,
+            "expected_staging_paths": expected_staging_paths,
+        }
+        if replacement_control is not None:
+            attempt_record["replacement"] = replacement_control
+        try:
+            attempt = methods["begin_dataset_persistence_attempt"](
+                attempt_record
+            )
+        except Exception as error:
+            refreshed = methods["get_dataset_persistence_attempt"](dataset_id)
+            if isinstance(refreshed, dict) and refreshed != attempt_record:
+                raise ToolExecutionError(
+                    "DATASET_IDENTITY_COLLISION",
+                    "Persistence begin collided with different attempt metadata.",
+                    recoverable=False,
+                ) from error
+            if refreshed != attempt_record:
+                raise ToolExecutionError(
+                    "DATASET_PERSISTENCE_PENDING",
+                    (
+                        f"Persistence begin response was ambiguous after "
+                        f"{type(error).__name__}; replay the exact tool call."
+                    ),
+                    recoverable=True,
+                ) from error
+            attempt = refreshed
+        _write_attempt_journal(
+            context,
+            runtime_root=runtime_root,
+            attempt=attempt,
+        )
+    try:
+        _state, artifact, staged = (
+            db_rag_persistence.persist_sql_subset_artifact(
+                {
+                    "artifacts": context.artifact_store.snapshot(),
+                    "meta": {MetaKeys.THREAD_ID: context.thread_id},
+                },
+                candidate,
+                approved_selection,
+                execution,
+                selection_artifact_id=plan_id,
+                sql_candidate_artifact_id=sql_artifact.id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                sql_version=sql_artifact.version,
+                dataset_id=dataset_id,
+                dataset_name=deterministic_dataset_name(goal_text=plan.goal),
+                exact_sql=validated_sql,
+                predecessor_dataset_id=(
+                    predecessor_identity[0]
+                    if predecessor_identity
+                    else None
+                ),
+                predecessor_dataset_version=(
+                    predecessor_identity[1]
+                    if predecessor_identity
+                    else None
+                ),
+                relationship_metrics=relationship_metrics,
+                grain_columns=grain_columns,
+                make_active=False,
+                stage_only=True,
+                artifact_version=1,
+                artifact_status="pending_review",
+            )
+        )
+    except FileExistsError as error:
+        raise ToolExecutionError(
+            "DATASET_DURABLE_COLLISION",
+            str(error),
+            recoverable=True,
+        ) from error
+    except Exception as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_FAILED",
+            f"{type(error).__name__}: {error}",
+            recoverable=True,
+        ) from error
+    if staged is None:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_FAILED",
+            "Dataset staging did not return a durable manifest.",
+            recoverable=False,
+        )
+    staged_attempt = {
+        **attempt,
+        "state": "staged",
+        "manifest": staged.manifest,
+        "dataset": artifact,
+    }
+    _write_attempt_journal(
+        context,
+        runtime_root=runtime_root,
+        attempt=staged_attempt,
+    )
+    try:
+        attempt = methods["advance_dataset_persistence_attempt"](
+            dataset_id,
+            lineage=lineage,
+            expected_state="begun",
+            state="staged",
+            manifest=staged.manifest,
+            dataset=artifact,
+        )
+    except Exception as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            (
+                f"Staged dataset remains tracked after {type(error).__name__}; "
+                "replay the exact tool call."
+            ),
+            recoverable=True,
+        ) from error
+    try:
+        promote_staged_dataset_artifact(
+            runtime_root=runtime_root,
+            thread_id=context.thread_id,
+            dataset_id=dataset_id,
+            expected_final_paths=staged.expected_final_paths,
+            expected_staging_paths=staged.expected_staging_paths,
+            manifest=staged.manifest,
+        )
+    except ValueError as error:
+        raise ToolExecutionError(
+            "DATASET_DURABLE_COLLISION",
+            str(error),
+            recoverable=False,
+        ) from error
+    except OSError as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            f"Staged promotion could not complete: {type(error).__name__}.",
+            recoverable=True,
+        ) from error
+    promoted_attempt = {**attempt, "state": "promoted"}
+    promoted_attempt = _verify_canonical_attempt_dataset(
+        context,
+        attempt=promoted_attempt,
+        lineage=lineage,
+        validated_sql=validated_sql,
+        runtime_root=runtime_root,
+    )
+    _write_attempt_journal(
+        context,
+        runtime_root=runtime_root,
+        attempt=promoted_attempt,
+    )
+    try:
+        attempt = methods["advance_dataset_persistence_attempt"](
+            dataset_id,
+            lineage=lineage,
+            expected_state="staged",
+            state="promoted",
+        )
+    except Exception as error:
+        raise ToolExecutionError(
+            "DATASET_PERSISTENCE_PENDING",
+            (
+                f"Promoted dataset remains tracked after {type(error).__name__}; "
+                "replay the exact tool call."
+            ),
+            recoverable=True,
+        ) from error
+    return _commit_persistence_attempt(
+        context,
+        methods=methods,
+        attempt=attempt,
+        plan_id=plan_id,
+        plan_version=plan_version,
+        reused=False,
+        runtime_root=runtime_root,
+    )
+
+
+def _inspect_dataset(
+    arguments: dict[str, Any],
+    context: ToolContext,
+) -> ToolResult:
+    plan_id = arguments["plan_id"]
+    plan_version = int(arguments["plan_version"])
+    _approved_plan(
+        context,
+        plan_id=plan_id,
+        plan_version=plan_version,
+    )
+    dataset = _require_artifact(
+        context,
+        artifact_id=arguments["dataset_id"],
+        version=int(arguments["dataset_version"]),
+    )
+    if dataset.status != "pending_review":
+        raise ToolExecutionError(
+            "DATASET_NOT_PENDING_REVIEW",
+            "Quality inspection requires an exact pending-review dataset.",
+            recoverable=True,
+        )
+    dataset_ref = ArtifactRef(
+        id=dataset.id,
+        kind=dataset.kind,
+        version=dataset.version,
+    )
+    plan_ref = ArtifactRef(
+        id=plan_id,
+        kind="dataset_plan",
+        version=plan_version,
+    )
+    try:
+        report_ref = inspect_dataset_artifact(
+            artifact_store=context.artifact_store,
+            dataset_ref=dataset_ref,
+            plan_ref=plan_ref,
+        )
+    except (KeyError, ValueError) as error:
+        raise ToolExecutionError(
+            "DATASET_QUALITY_INSPECTION_FAILED",
+            str(error),
+            recoverable=True,
+        ) from error
+    report = context.artifact_store.require(report_ref)
+    content = _render_quality(report.content)
+    return ToolResult(
+        message=(
+            f"Dataset quality quality_report_id={report_ref.id} "
+            f"version={report_ref.version} dataset_id={dataset.id} "
+            f"dataset_version={dataset.version}: "
+            f"{json.dumps(content, sort_keys=True)}"
+        ),
+        artifacts=(report_ref,),
+    )
+
+
+def build_db_rag_tool_registry() -> ToolRegistry:
+    definitions: list[
+        tuple[str, str, type[BaseModel], bool, bool, Callable[..., ToolResult]]
+    ] = [
+        (
+            "open_artifact",
+            "Open an exact versioned artifact using a bounded row-free representation.",
+            OpenArtifactArguments,
+            True,
+            False,
+            _open_artifact,
+        ),
+        (
+            "search_catalog",
+            (
+                "Batch all currently needed semantic schema probes, search the "
+                "runtime catalog once, and store bounded field evidence."
+            ),
+            CatalogSearchArguments,
+            True,
+            False,
+            _search_catalog,
+        ),
+        (
+            "inspect_table",
+            "Inspect bounded runtime schema details for one table.",
+            InspectTableArguments,
+            True,
+            False,
+            _inspect_table,
+        ),
+        (
+            "find_join_paths",
+            "Find observed direct or multi-hop paths between required runtime fields.",
+            FindJoinPathsArguments,
+            True,
+            False,
+            _find_join_paths,
+        ),
+        (
+            "profile_relationship",
+            (
+                "Profile an explicit source relationship and persist bounded "
+                "pre-extraction relationship-risk evidence."
+            ),
+            ProfileRelationshipArguments,
+            True,
+            False,
+            _profile_relationship,
+        ),
+        (
+            "save_dataset_plan",
+            (
+                "Save a complete structured dataset plan or exact revision; "
+                "every join must declare inner or left join_type."
+            ),
+            SaveDatasetPlanArguments,
+            False,
+            False,
+            _save_dataset_plan,
+        ),
+        (
+            "validate_dataset_plan",
+            (
+                "Validate only runtime plan fields, sources, operations, "
+                "relationships, and unresolved items. If validation fails, "
+                "details.issues contains all independent issues to repair "
+                "together."
+            ),
+            ValidateDatasetPlanArguments,
+            True,
+            False,
+            _validate_dataset_plan,
+        ),
+        (
+            "validate_and_extract",
+            (
+                "Compile and immediately validate and extract an approved "
+                "dataset plan. Omit sql for the deterministic first attempt. "
+                "After SQL_REPAIR_REQUIRED, submit repaired read-only SQL "
+                "against the same frozen plan."
+            ),
+            ValidateAndExtractArguments,
+            False,
+            False,
+            _validate_and_extract,
+        ),
+        (
+            "inspect_dataset",
+            (
+                "Create a deterministic row-private quality report for an exact "
+                "pending-review dataset and approved plan."
+            ),
+            InspectDatasetArguments,
+            False,
+            False,
+            _inspect_dataset,
+        ),
+    ]
+    tools: list[AgentTool] = [
+        _FunctionTool(
+            spec=ToolSpec(
+                name=_dbrag_tool_name(operation),
+                description=description,
+                args_model=args_model,
+                read_only=read_only,
+                interrupting=interrupting,
+            ),
+            handler=handler,
+        )
+        for operation, description, args_model, read_only, interrupting, handler in definitions
+    ]
+    tools.append(RequestDatasetPlanReviewTool())
+    tools.append(RequestDatasetReviewTool())
+    return ToolRegistry(tools)
+
+
+__all__ = ["build_db_rag_tool_registry"]

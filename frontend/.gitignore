@@ -1,0 +1,10 @@
+node_modules/
+dist/*
+!dist/index.html
+!dist/build-manifest.json
+!dist/assets/
+dist/assets/*
+!dist/assets/**
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
