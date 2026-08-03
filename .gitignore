@@ -20,7 +20,6 @@ frontend/vite.config.d.ts
 scripts/
 tests/
 runtime/
-study_design/
 
 # Local tools and scratch work.
 .worktrees/
@@ -31,12 +30,9 @@ docs/
 run_fastapi_typescript_app.py
 slides/
 tmp/
-benchmark_app/
 todo.md
 
 # Raw/private source data and user-generated artifacts.
-local_data/
-data/
 synthetic_report_india/
 runtime/*
 !runtime/.gitkeep
@@ -46,6 +42,6 @@ study_data/
 publication/
 
 # Private validation and generated benchmark material.
-docs/validation_prep/
+
 db_rag/benchmark/
-runtime/datasets/
+

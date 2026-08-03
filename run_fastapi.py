@@ -67,7 +67,7 @@ def ensure_active_provider_credential(
     while True:
         try:
             entered_key = normalize_secret_input(
-                getpass_fn("Paste your OpenAI API key (press Enter to cancel): ")
+                getpass_fn("Paste your OpenAI API key (press Enter to continue): ")
             )
         except (EOFError, KeyboardInterrupt) as error:
             raise StartupConfigurationError(
