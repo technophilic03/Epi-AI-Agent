@@ -1,8 +1,8 @@
-# Epi AI Agent demo
+# Introduction
 
-This is a lightweight local demo of Epi AI Agent. It runs on macOS and Linux
+This is a lightweight local demo of AI Agent focusing on Epidemiological Research. It runs on macOS and Linux
 with Python 3.12 and an OpenAI API key.
-
+[Watch the demo video](https://drive.google.com/file/d/1cHvKXqePVmtHrQcJatWAn8k-g_BR4HHr/view?usp=sharing)
 ## Start the demo
 
 ```bash
