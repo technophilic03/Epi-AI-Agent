@@ -143,6 +143,20 @@ def _grain_uniqueness(
     }
 
 
+def _persisted_post_sql_warnings(
+    provenance: dict[str, Any],
+) -> list[QualityWarning]:
+    warnings: list[QualityWarning] = []
+    for item in list(provenance.get("post_sql_warnings") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            warnings.append(QualityWarning.model_validate(item))
+        except Exception:
+            continue
+    return warnings
+
+
 def _warnings(
     *,
     row_count: int,
@@ -152,8 +166,9 @@ def _warnings(
     unexpected_columns: list[str],
     join_expansion: dict[str, float],
     relationship_metrics: list[dict[str, Any]],
+    inherited_warnings: list[QualityWarning] | None = None,
 ) -> list[QualityWarning]:
-    warnings: list[QualityWarning] = []
+    warnings: list[QualityWarning] = list(inherited_warnings or [])
     if row_count == 0:
         warnings.append(
             QualityWarning(
@@ -232,7 +247,15 @@ def _warnings(
                 ),
             )
         )
-    return warnings
+    deduplicated: list[QualityWarning] = []
+    seen: set[tuple[str, str]] = set()
+    for warning in warnings:
+        key = (warning.code, warning.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(warning)
+    return deduplicated
 
 
 def inspect_dataset(
@@ -269,29 +292,61 @@ def inspect_dataset(
         )
         for column in columns
     }
-    coverage = {
-        _concept_key(concept, index): bool(_concept_fields(concept))
-        and all(column in dataframe.columns for column in _concept_fields(concept))
-        for index, concept in enumerate(plan.concepts)
-    }
-    expected_columns = _planned_columns(plan)
-    unexpected_columns = sorted(set(columns) - expected_columns)
-    duplicate_grain_rows, missing_grain_columns = _duplicate_grain_rows(
-        dataframe,
-        provenance,
-        plan,
-    )
-    grain_uniqueness = _grain_uniqueness(dataframe, provenance, plan)
-    join_expansion: dict[str, float] = {}
-    if grain_uniqueness and grain_uniqueness["distinct_key_count"] > 0:
-        join_expansion["target_grain"] = (
-            float(grain_uniqueness["row_count"])
-            / float(grain_uniqueness["distinct_key_count"])
+    optional_warnings: list[QualityWarning] = []
+    try:
+        coverage = {
+            _concept_key(concept, index): bool(_concept_fields(concept))
+            and all(
+                column in dataframe.columns
+                for column in _concept_fields(concept)
+            )
+            for index, concept in enumerate(plan.concepts)
+        }
+        expected_columns = _planned_columns(plan)
+        reconciled_columns = set(
+            dict(provenance.get("output_column_sources") or {})
         )
-    relationship_metrics = [
-        dict(metric)
-        for metric in provenance.get("relationship_metrics") or []
-        if isinstance(metric, dict)
+        unexpected_columns = sorted(
+            set(columns) - expected_columns - reconciled_columns
+        )
+        duplicate_grain_rows, missing_grain_columns = _duplicate_grain_rows(
+            dataframe,
+            provenance,
+            plan,
+        )
+        grain_uniqueness = _grain_uniqueness(dataframe, provenance, plan)
+        join_expansion: dict[str, float] = {}
+        if grain_uniqueness and grain_uniqueness["distinct_key_count"] > 0:
+            join_expansion["target_grain"] = (
+                float(grain_uniqueness["row_count"])
+                / float(grain_uniqueness["distinct_key_count"])
+            )
+        relationship_metrics = [
+            dict(metric)
+            for metric in provenance.get("relationship_metrics") or []
+            if isinstance(metric, dict)
+        ]
+    except (AttributeError, TypeError, ValueError) as error:
+        coverage = {}
+        unexpected_columns = []
+        duplicate_grain_rows = None
+        missing_grain_columns = []
+        grain_uniqueness = None
+        join_expansion = {}
+        relationship_metrics = []
+        optional_warnings.append(
+            QualityWarning(
+                code="QUALITY_CHECK_INCOMPLETE",
+                severity="medium",
+                message=(
+                    "Optional dataset quality checks could not be completed: "
+                    f"{type(error).__name__}: {error}"
+                ),
+            )
+        )
+    inherited_warnings = [
+        *_persisted_post_sql_warnings(provenance),
+        *optional_warnings,
     ]
     report = DatasetQualityReport(
         dataset_id=dataset.id,
@@ -325,6 +380,7 @@ def inspect_dataset(
             unexpected_columns=unexpected_columns,
             join_expansion=join_expansion,
             relationship_metrics=relationship_metrics,
+            inherited_warnings=inherited_warnings,
         ),
     )
     return artifact_store.save_artifact(

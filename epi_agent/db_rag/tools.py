@@ -1497,54 +1497,74 @@ def _profile_matches_operation(
     return False
 
 
+def _relationship_metric_for_operation(
+    context: ToolContext,
+    operation: dict[str, Any],
+) -> dict[str, Any]:
+    artifact_id = str(
+        operation.get("relationship_artifact_id") or ""
+    ).strip()
+    artifact_version = operation.get("relationship_artifact_version")
+    relationship = _require_artifact(
+        context,
+        artifact_id=artifact_id,
+        version=artifact_version,
+        kind="relationship_profile",
+    )
+    key_pairs = _operation_key_pairs(operation)
+    left_table = str(operation.get("left_table") or "")
+    right_table = str(operation.get("right_table") or "")
+    profile = next(
+        (
+            value
+            for value in _relationship_profiles(relationship.content)
+            if _profile_matches_operation(
+                value,
+                left_table=left_table,
+                right_table=right_table,
+                key_pairs=key_pairs,
+            )
+        ),
+        None,
+    )
+    if profile is None:
+        raise ToolExecutionError(
+            "PLAN_RELATIONSHIP_UNPROVEN",
+            "Approved join relationship evidence is no longer available.",
+            recoverable=True,
+        )
+    return {
+        "evidence_label": "profiled relationship risk",
+        "relationship_artifact_id": relationship.id,
+        "relationship_artifact_version": relationship.version,
+        **dict(profile),
+    }
+
+
 def _plan_relationship_metrics(
     context: ToolContext,
     plan: DatasetPlan,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     metrics: list[dict[str, Any]] = []
+    warnings: list[dict[str, str]] = []
     for model in plan.operations:
         operation = model.model_dump(mode="json")
         if str(operation.get("name") or "").strip().casefold() != "join":
             continue
-        artifact_id = str(
-            operation.get("relationship_artifact_id") or ""
-        ).strip()
-        artifact_version = operation.get("relationship_artifact_version")
-        relationship = _require_artifact(
-            context,
-            artifact_id=artifact_id,
-            version=artifact_version,
-            kind="relationship_profile",
-        )
-        key_pairs = _operation_key_pairs(operation)
-        profile = next(
-            (
-                value
-                for value in _relationship_profiles(relationship.content)
-                if _profile_matches_operation(
-                    value,
-                    left_table=str(operation.get("left_table") or ""),
-                    right_table=str(operation.get("right_table") or ""),
-                    key_pairs=key_pairs,
-                )
-            ),
-            None,
-        )
-        if profile is None:
-            raise ToolExecutionError(
-                "PLAN_RELATIONSHIP_UNPROVEN",
-                "Approved join relationship evidence is no longer available.",
-                recoverable=True,
+        try:
+            metrics.append(_relationship_metric_for_operation(context, operation))
+        except ToolExecutionError as error:
+            warnings.append(
+                {
+                    "code": "RELATIONSHIP_METRICS_UNAVAILABLE",
+                    "severity": "medium",
+                    "message": (
+                        "Optional relationship metadata was unavailable after "
+                        f"SQL succeeded: {error}"
+                    ),
+                }
             )
-        metrics.append(
-            {
-                "evidence_label": "profiled relationship risk",
-                "relationship_artifact_id": relationship.id,
-                "relationship_artifact_version": relationship.version,
-                **dict(profile),
-            }
-        )
-    return metrics
+    return metrics, warnings
 
 
 _FILTER_OPERATOR_SQL = {
@@ -3560,7 +3580,7 @@ def _persist_extraction_result(
                     columns=_plan_reference_columns(plan),
                 ),
             ) from error
-    relationship_metrics = _plan_relationship_metrics(
+    relationship_metrics, post_sql_warnings = _plan_relationship_metrics(
         context,
         plan,
     )
@@ -3652,6 +3672,7 @@ def _persist_extraction_result(
                     else None
                 ),
                 relationship_metrics=relationship_metrics,
+                post_sql_warnings=post_sql_warnings,
                 grain_columns=grain_columns,
                 make_active=False,
                 stage_only=True,

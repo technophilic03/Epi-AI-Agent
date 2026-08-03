@@ -340,6 +340,7 @@ def persist_sql_subset_artifact(
     predecessor_dataset_id: str | None = None,
     predecessor_dataset_version: int | None = None,
     relationship_metrics: list[dict[str, Any]] | None = None,
+    post_sql_warnings: list[dict[str, Any]] | None = None,
     join_expansion: dict[str, float] | None = None,
     grain_columns: list[str] | None = None,
     runtime_root: Any = None,
@@ -406,6 +407,21 @@ def persist_sql_subset_artifact(
         selected_columns,
         sql=persisted_sql,
     )
+    reconciliation_warnings = list(reconciliation["warnings"])
+    for warning in list(post_sql_warnings or []):
+        if isinstance(warning, dict):
+            reconciliation_warnings.append(dict(warning))
+    deduplicated_warnings: list[dict[str, Any]] = []
+    seen_warning_keys: set[tuple[str, str]] = set()
+    for warning in reconciliation_warnings:
+        warning_key = (
+            str(warning.get("code") or "").strip(),
+            str(warning.get("message") or "").strip(),
+        )
+        if warning_key in seen_warning_keys:
+            continue
+        seen_warning_keys.add(warning_key)
+        deduplicated_warnings.append(dict(warning))
     provenance: dict[str, Any] = {
         "source": "db_rag_sql",
         "thread_id": thread_id,
@@ -440,7 +456,7 @@ def persist_sql_subset_artifact(
         "output_column_sources": dict(
             reconciliation["output_column_sources"]
         ),
-        "post_sql_warnings": list(reconciliation["warnings"]),
+        "post_sql_warnings": deduplicated_warnings,
     }
     if plan_id and plan_version is not None:
         provenance.update(
