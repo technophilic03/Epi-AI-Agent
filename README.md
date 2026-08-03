@@ -22,8 +22,7 @@ python study_installer.py --study report-india-synthetic-0.2.0.tar.gz
 python run_fastapi.py
 ```
 
-On the first native start, choose where to keep local runtime data. Press Enter
-to use this project's `runtime/` folder. That folder holds conversations,
+On the first native start, choose where to keep study data and local runtime data. These folders hold conversations,
 uploads, generated datasets, and results; it is intentionally not committed.
 
 You will then be asked to enter your OpenAI API key, so have it ready. Once it
