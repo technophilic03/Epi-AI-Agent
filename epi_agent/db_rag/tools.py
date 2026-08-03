@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import duckdb
 from pydantic import (
     BaseModel,
     Field,
@@ -76,17 +78,9 @@ _DATASET_KINDS = {
 }
 
 _PLAN_REPAIR_HINTS = {
-    "PLAN_SOURCE_UNAVAILABLE": "Use a runtime source returned by schema discovery.",
     "PLAN_FIELD_UNAVAILABLE": "Replace the field with an available table and column from the runtime catalog.",
-    "PLAN_OUTPUT_NAME_CONFLICT": "Give fields from different source columns unique output_column aliases.",
-    "PLAN_FILTER_CANONICAL_REQUIRED": "Add the required filter description and canonical predicate or value_constraints.",
-    "PLAN_OPERATION_INVALID": "Reference only structured fields already present in the plan or its runtime operations.",
-    "PLAN_RELATIONSHIP_UNPROVEN": "Use an exact relationship profile and matching join key pairs.",
-    "PLAN_JOIN_KEY_MISSING": "Replace the join key with an available column from the selected table.",
-    "PLAN_TABLE_GRAPH_DISCONNECTED": "Add the missing evidence-backed join operation or remove the disconnected table.",
-    "PLAN_REDUCTION_FIELD_UNAVAILABLE": "Use an available field from the reduction table.",
-    "PLAN_REDUCTION_REFERENCE_INVALID": "Keep reduction fields in the declared reduction source table.",
-    "PLAN_REDUCTION_FILTER_INVALID": "Use an available field from the reduced table in the reduction filter.",
+    "PLAN_FILTER_VALUE_UNAVAILABLE": "Use an observed stored value compatible with the runtime field.",
+    "PLAN_JOIN_UNAVAILABLE": "Use tables connected by an observed runtime key path.",
 }
 
 
@@ -1228,46 +1222,18 @@ def _save_dataset_plan(
 
 def _plan_output_fields(plan: DatasetPlan) -> list[PlanField]:
     fields = [
-        field
-        for field in plan.required_fields
-        if field.roles & {"requested", "identifier", "grain"}
+        *plan.required_fields,
+        *(field for concept in plan.concepts for field in concept.fields),
     ]
-    for concept in plan.concepts:
-        fields.extend(
-            field
-            for field in concept.fields
-            if field.roles & {"requested", "identifier", "grain"}
-        )
-    return fields
-
-
-def _validate_plan_field_role(
-    field: PlanField,
-    *,
-    required_role: str,
-    path: str,
-) -> None:
-    if required_role in field.roles:
-        return
-    if required_role == "requested":
-        message = (
-            "A field assigned to a requested scientific concept must declare "
-            "the requested role."
-        )
-    else:
-        message = (
-            "A field in required_fields must declare the identifier role."
-        )
-    _raise_plan_error(
-        "PLAN_ROLE_COLLECTION_INVALID",
-        message,
-        details={
-            "path": path,
-            "source": field.source,
-            "table": field.table,
-            "column": field.column,
-        },
-    )
+    seen: set[tuple[str, str, str]] = set()
+    output: list[PlanField] = []
+    for field in fields:
+        key = (field.source, field.table, field.column)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(field)
+    return output
 
 
 def _plan_issue(
@@ -1297,46 +1263,6 @@ def _plan_issue(
         ),
     )
     return issue
-
-
-def _collect_plan_check(
-    issues: list[dict[str, Any]],
-    check: Callable[[], None],
-    *,
-    path: str | None = None,
-    source: str | None = None,
-    table: str | None = None,
-    column: str | None = None,
-) -> None:
-    try:
-        check()
-    except ToolExecutionError as error:
-        issue = _plan_issue(
-            error,
-            path=path,
-            source=source,
-            table=table,
-            column=column,
-        )
-        signature = (
-            issue.get("code"),
-            issue.get("message"),
-            issue.get("source"),
-            issue.get("table"),
-            issue.get("column"),
-        )
-        if not any(
-            (
-                existing.get("code"),
-                existing.get("message"),
-                existing.get("source"),
-                existing.get("table"),
-                existing.get("column"),
-            )
-            == signature
-            for existing in issues
-        ):
-            issues.append(issue)
 
 
 def _raise_collected_plan_errors(issues: list[dict[str, Any]]) -> None:
@@ -1409,57 +1335,6 @@ def _plan_reference_keys(plan: DatasetPlan) -> set[tuple[str, str, str]]:
     return keys
 
 
-def _validate_plan_reduction(
-    reduction: Any,
-    *,
-    context: ToolContext,
-) -> None:
-    if reduction.source not in require_context_study(context).data_sources:
-        _raise_plan_error(
-            "PLAN_SOURCE_UNAVAILABLE",
-            f"Reduction references unavailable source {reduction.source}.",
-            details={"source": reduction.source, "table": reduction.table},
-        )
-    references = [*reduction.group_by, reduction.order_by, *reduction.tie_breakers]
-    references.extend(aggregate.field for aggregate in reduction.aggregates)
-    for reference in references:
-        if reference is None:
-            continue
-        reference_details = {
-            "source": reference.source,
-            "table": reference.table,
-            "column": reference.column,
-        }
-        if reference.source != reduction.source or reference.table != reduction.table:
-            _raise_plan_error(
-                "PLAN_REDUCTION_REFERENCE_INVALID",
-                "Reduction fields must belong to its declared source table.",
-                details=reference_details,
-            )
-        if not _catalog_field_exists(context, reference.table, reference.column):
-            _raise_plan_error(
-                "PLAN_REDUCTION_FIELD_UNAVAILABLE",
-                f"Reduction field is unavailable: {reference.table}.{reference.column}.",
-                details=reference_details,
-            )
-    _validate_plan_filter_contract(reduction.filters)
-    for filter_entry in reduction.filters:
-        for constraint in filter_entry.get("value_constraints") or []:
-            if not isinstance(constraint, dict):
-                continue
-            table = str(constraint.get("table") or reduction.table).strip()
-            column = str(constraint.get("column") or "").strip()
-            if table != reduction.table or not _catalog_field_exists(context, table, column):
-                _raise_plan_error(
-                    "PLAN_REDUCTION_FILTER_INVALID",
-                    "Reduction filters must use available fields from the reduced table.",
-                    details={
-                        "source": reduction.source,
-                        "table": table,
-                        "column": column,
-                    },
-                )
-
 def _raise_plan_error(
     code: str,
     message: str,
@@ -1472,86 +1347,6 @@ def _raise_plan_error(
         recoverable=True,
         details=details,
     )
-
-
-def _validate_plan_filter_contract(filters: list[dict[str, Any]]) -> None:
-    for filter_entry in filters:
-        description = str(filter_entry.get("description") or "").strip()
-        predicate = str(filter_entry.get("predicate") or "").strip()
-        references = [
-            item
-            for item in list(filter_entry.get("referenced_columns") or [])
-            if isinstance(item, dict)
-        ]
-        constraints = [
-            item
-            for item in list(filter_entry.get("value_constraints") or [])
-            if isinstance(item, dict)
-        ]
-        if not description or (not predicate and not constraints):
-            _raise_plan_error(
-                "PLAN_FILTER_CANONICAL_REQUIRED",
-                (
-                    "Each dataset-plan filter requires a description and either "
-                    "a canonical predicate or value_constraints."
-                ),
-            )
-        if predicate and not references:
-            _raise_plan_error(
-                "PLAN_FILTER_CANONICAL_REQUIRED",
-                (
-                    "A canonical filter predicate requires referenced_columns "
-                    "that identify every reviewed predicate field."
-                ),
-            )
-        for constraint in constraints:
-            has_value = "value" in constraint
-            has_values = "values" in constraint
-            value = constraint.get("value")
-            values = constraint.get("values")
-            if (
-                not str(constraint.get("table") or "").strip()
-                or not str(constraint.get("column") or "").strip()
-                or not str(constraint.get("operator") or "").strip()
-                or has_value == has_values
-                or (
-                    has_value
-                    and (
-                        value is None
-                        or (
-                            isinstance(value, str)
-                            and not value.strip()
-                        )
-                    )
-                )
-                or (
-                    has_values
-                    and (
-                        not isinstance(values, list)
-                        or not values
-                    )
-                )
-            ):
-                _raise_plan_error(
-                    "PLAN_FILTER_CANONICAL_REQUIRED",
-                    (
-                        "Each value constraint requires table, column, operator, "
-                        "and exactly one non-empty value or values field."
-                    ),
-                )
-
-
-def _resolve_plan_filter_references(
-    filters: list[dict[str, Any]],
-    field_keys: set[tuple[str, str, str]],
-) -> None:
-    try:
-        resolve_filter_references(
-            filters,
-            available_fields=field_keys,
-        )
-    except FilterReferenceResolutionError as error:
-        _raise_plan_error(error.code, str(error))
 
 
 def _operation_key_pairs(operation: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1670,161 +1465,342 @@ def _plan_relationship_metrics(
     return metrics
 
 
-def _validate_operation(
-    operation: dict[str, Any],
-    *,
-    context: ToolContext,
-    plan_fields: set[tuple[str, str, str]],
-) -> None:
-    operation_name = str(operation.get("type") or operation.get("name") or "").strip()
-    if not operation_name:
-        _raise_plan_error("PLAN_OPERATION_INVALID", "Plan operation has no runtime type.")
-
-    source_name = str(operation.get("source") or "").strip()
-    if (
-        source_name
-        and source_name not in require_context_study(context).data_sources
-    ):
-        _raise_plan_error(
-            "PLAN_SOURCE_UNAVAILABLE",
-            f"Plan operation references unavailable source {source_name}.",
-        )
-
-    for raw_field in operation.get("field_refs") or []:
-        if not isinstance(raw_field, dict):
-            _raise_plan_error(
-                "PLAN_OPERATION_INVALID",
-                "Plan operation field reference is not structured.",
-            )
-        key = tuple(
-            str(raw_field.get(part) or "").strip()
-            for part in ("source", "table", "column")
-        )
-        if not all(key) or key not in plan_fields:
-            _raise_plan_error(
-                "PLAN_OPERATION_INVALID",
-                "Plan operation references a field outside the plan.",
-            )
-
-    if operation_name.casefold() != "join":
-        return
-    join_type = str(operation.get("join_type") or "").strip().casefold()
-    if not join_type:
-        _raise_plan_error(
-            "PLAN_JOIN_STRATEGY_REQUIRED",
-            "Join operation requires an explicit join_type strategy.",
-        )
-    if join_type not in {"inner", "left"}:
-        _raise_plan_error(
-            "PLAN_JOIN_STRATEGY_UNSUPPORTED",
-            (
-                "Join operation uses an unsupported join_type. "
-                "The base protocol supports inner and left."
-            ),
-        )
-    required_values = {
-        key: str(operation.get(key) or "").strip()
-        for key in ("source", "left_table", "right_table")
-    }
-    if not all(required_values.values()):
-        _raise_plan_error(
-            "PLAN_RELATIONSHIP_UNPROVEN",
-            "Join operation requires source, left_table, and right_table.",
-        )
-    key_pairs = _operation_key_pairs(operation)
-    relationship_id = str(operation.get("relationship_artifact_id") or "").strip()
-    relationship_version = operation.get("relationship_artifact_version")
-    if not relationship_id or not isinstance(relationship_version, int):
-        _raise_plan_error(
-            "PLAN_RELATIONSHIP_UNPROVEN",
-            "Join operation requires an exact relationship artifact reference.",
-        )
-    relationship = _require_artifact(
-        context,
-        artifact_id=relationship_id,
-        version=relationship_version,
-        kind="relationship_profile",
-    )
-    if str(relationship.content.get("source") or "") != required_values["source"]:
-        _raise_plan_error(
-            "PLAN_RELATIONSHIP_UNPROVEN",
-            "Join operation source does not match relationship evidence.",
-        )
-    if not any(
-        _profile_matches_operation(
-            profile,
-            left_table=required_values["left_table"],
-            right_table=required_values["right_table"],
-            key_pairs=key_pairs,
-        )
-        for profile in _relationship_profiles(relationship.content)
-    ):
-        _raise_plan_error(
-            "PLAN_RELATIONSHIP_UNPROVEN",
-            "Join operation does not match an exact profiled relationship edge.",
-        )
-    for left_column, right_column in key_pairs:
-        for table, column in (
-            (required_values["left_table"], left_column),
-            (required_values["right_table"], right_column),
-        ):
-            if not _catalog_field_exists(context, table, column):
-                _raise_plan_error(
-                    "PLAN_JOIN_KEY_MISSING",
-                    f"Runtime join key is unavailable: {table}.{column}.",
-                )
+_FILTER_OPERATOR_SQL = {
+    "=": "=",
+    "==": "=",
+    "!=": "!=",
+    "<>": "<>",
+    "<": "<",
+    "<=": "<=",
+    ">": ">",
+    ">=": ">=",
+    "in": "=",
+    "not in": "=",
+    "ilike": "ILIKE",
+}
 
 
-def _validate_plan_table_graph(
+def _quote_duckdb_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _plan_fact_references(
     plan: DatasetPlan,
-    *,
-    plan_fields: set[tuple[str, str, str]],
-) -> None:
-    table_refs = {(source, table) for source, table, _column in plan_fields}
-    for operation in plan.operations:
-        if operation.name.strip().casefold() != "join" or not operation.source:
-            continue
-        table_refs.add((operation.source, str(operation.left_table or "").strip()))
-        table_refs.add((operation.source, str(operation.right_table or "").strip()))
-    if len(table_refs) < 2:
-        return
+    constraints: list[dict[str, Any]],
+    source_ids: set[str],
+) -> list[tuple[str, str, str, str]]:
+    references: dict[tuple[str, str, str], str] = {}
 
-    adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {
-        table_ref: set() for table_ref in table_refs
-    }
-    for model in plan.operations:
-        operation = model.model_dump(mode="json")
-        operation_name = str(
-            operation.get("type") or operation.get("name") or ""
-        ).strip().casefold()
-        if operation_name != "join":
-            continue
-        source = str(operation.get("source") or "").strip()
-        left = (source, str(operation.get("left_table") or "").strip())
-        right = (source, str(operation.get("right_table") or "").strip())
-        if left not in table_refs or right not in table_refs:
-            continue
-        adjacency[left].add(right)
-        adjacency[right].add(left)
+    def add(source: Any, table: Any, column: Any, path: str) -> None:
+        normalized_source = str(source or "").strip()
+        if not normalized_source and len(source_ids) == 1:
+            normalized_source = next(iter(source_ids))
+        key = (
+            normalized_source,
+            str(table or "").strip(),
+            str(column or "").strip(),
+        )
+        references.setdefault(key, path)
 
-    root = next(iter(table_refs))
-    connected = {root}
-    pending = [root]
-    while pending:
-        current = pending.pop()
-        for neighbor in adjacency[current]:
-            if neighbor in connected:
+    for index, field in enumerate(plan.required_fields):
+        add(field.source, field.table, field.column, f"required_fields[{index}]")
+    for concept_index, concept in enumerate(plan.concepts):
+        for field_index, field in enumerate(concept.fields):
+            add(
+                field.source,
+                field.table,
+                field.column,
+                f"concepts[{concept_index}].fields[{field_index}]",
+            )
+    for constraint in constraints:
+        add(
+            constraint.get("source"),
+            constraint.get("table"),
+            constraint.get("column"),
+            str(constraint.get("path") or "filters"),
+        )
+    return [
+        (source, table, column, path)
+        for (source, table, column), path in references.items()
+    ]
+
+
+def _normalized_value_constraints(
+    plan: DatasetPlan,
+    source_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    constraints: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for filter_index, filter_entry in enumerate(plan.filters):
+        raw_constraints = filter_entry.get("value_constraints") or []
+        if not isinstance(raw_constraints, list) or not raw_constraints:
+            error = ToolExecutionError(
+                "PLAN_FILTER_VALUE_UNAVAILABLE",
+                "A requested filter has no structured value constraint to verify.",
+                recoverable=True,
+                details={"path": f"filters[{filter_index}]"},
+            )
+            issues.append(_plan_issue(error, path=f"filters[{filter_index}]"))
+            continue
+        for constraint_index, raw_constraint in enumerate(raw_constraints):
+            path = f"filters[{filter_index}].value_constraints[{constraint_index}]"
+            if not isinstance(raw_constraint, dict):
+                error = ToolExecutionError(
+                    "PLAN_FILTER_VALUE_UNAVAILABLE",
+                    "Filter value constraint is not structured.",
+                    recoverable=True,
+                )
+                issues.append(_plan_issue(error, path=path))
                 continue
-            connected.add(neighbor)
-            pending.append(neighbor)
-    if connected != table_refs:
-        _raise_plan_error(
-            "PLAN_TABLE_GRAPH_DISCONNECTED",
+            constraint = dict(raw_constraint)
+            constraint["path"] = path
+            source = str(constraint.get("source") or "").strip()
+            if not source and len(source_ids) == 1:
+                constraint["source"] = next(iter(source_ids))
+            table = str(constraint.get("table") or "").strip()
+            column = str(constraint.get("column") or "").strip()
+            operator = str(constraint.get("operator") or "").strip().casefold()
+            has_value = "value" in constraint
+            has_values = "values" in constraint
+            values = constraint.get("values")
+            valid_values = has_value != has_values and (
+                has_value or isinstance(values, list) and bool(values)
+            )
+            if (
+                not str(constraint.get("source") or "").strip()
+                or not table
+                or not column
+                or operator not in _FILTER_OPERATOR_SQL
+                or not valid_values
+            ):
+                error = ToolExecutionError(
+                    "PLAN_FILTER_VALUE_UNAVAILABLE",
+                    "Filter value constraint lacks a verifiable runtime field, operator, or value.",
+                    recoverable=True,
+                )
+                issues.append(
+                    _plan_issue(
+                        error,
+                        path=path,
+                        source=str(constraint.get("source") or ""),
+                        table=table,
+                        column=column,
+                    )
+                )
+                continue
+            constraint["operator"] = operator
+            constraints.append(constraint)
+    return constraints, issues
+
+
+def _filter_constraint_values(constraint: dict[str, Any]) -> list[Any]:
+    if "values" in constraint:
+        return list(constraint.get("values") or [])
+    return [constraint.get("value")]
+
+
+def _filter_value_exists(
+    *,
+    database_path: Path,
+    table: str,
+    column: str,
+    operator: str,
+    value: Any,
+) -> bool:
+    operator_sql = _FILTER_OPERATOR_SQL[operator]
+    table_sql = _quote_duckdb_identifier(table)
+    column_sql = _quote_duckdb_identifier(column)
+    with duckdb.connect(str(database_path), read_only=True) as connection:
+        connection.execute(
+            f"SELECT 1 FROM {table_sql} "
+            f"WHERE {column_sql} {operator_sql} ? LIMIT 0",
+            [value],
+        )
+        return (
+            connection.execute(
+                f"SELECT 1 FROM {table_sql} "
+                f"WHERE {column_sql} IS NOT DISTINCT FROM ? LIMIT 1",
+                [value],
+            ).fetchone()
+            is not None
+        )
+
+
+def _source_database_path(context: ToolContext, source_name: str) -> Path:
+    source = _require_source(context, source_name)
+    path = getattr(source, "path", None)
+    if path is None:
+        raise ToolExecutionError(
+            "PLAN_FILTER_VALUE_UNAVAILABLE",
+            f"Runtime source does not expose a read-only DuckDB path: {source_name}.",
+            recoverable=True,
+        )
+    return Path(path)
+
+
+def _required_plan_tables(
+    plan: DatasetPlan,
+    constraints: list[dict[str, Any]],
+    source_ids: set[str],
+) -> dict[str, set[str]]:
+    tables: dict[str, set[str]] = {}
+
+    def add(source: Any, table: Any) -> None:
+        source_name = str(source or "").strip()
+        if not source_name and len(source_ids) == 1:
+            source_name = next(iter(source_ids))
+        table_name = str(table or "").strip()
+        if source_name and table_name:
+            tables.setdefault(source_name, set()).add(table_name)
+
+    for field in [
+        *plan.required_fields,
+        *(field for concept in plan.concepts for field in concept.fields),
+    ]:
+        add(field.source, field.table)
+    for constraint in constraints:
+        add(constraint.get("source"), constraint.get("table"))
+    return tables
+
+
+def _join_profile_edges(
+    plan: DatasetPlan,
+    context: ToolContext,
+    source_name: str,
+) -> list[dict[str, Any]]:
+    inventory = _relationship_inventory(context, source_name)
+    profiles: list[Any] = []
+    for operation in plan.operations:
+        if operation.name.strip().casefold() != "join":
+            continue
+        if str(operation.source or source_name).strip() != source_name:
+            continue
+        left_table = str(operation.left_table or "").strip()
+        right_table = str(operation.right_table or "").strip()
+        pairs = [
+            (pair.left_column, pair.right_column)
+            for pair in operation.key_pairs
+            if pair.left_column and pair.right_column
+        ]
+        if not left_table or not right_table or not pairs:
+            continue
+        try:
+            profile = inventory.profile_relationship(left_table, right_table, pairs)
+        except (KeyError, ValueError, duckdb.Error):
+            continue
+        if profile.matched_keys > 0:
+            profiles.append(profile)
+    try:
+        profiles.extend(inventory.candidate_relationships())
+    except (KeyError, ValueError, duckdb.Error):
+        pass
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    for profile in profiles:
+        if profile.matched_keys <= 0:
+            continue
+        key_pairs = tuple(
+            (str(left), str(right))
+            for left, right in profile.key_pairs
+        )
+        key = (profile.left_table, profile.right_table, key_pairs)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(
+            {
+                "source": source_name,
+                "left_table": profile.left_table,
+                "right_table": profile.right_table,
+                "key_pairs": [
+                    {
+                        "left_column": left,
+                        "right_column": right,
+                    }
+                    for left, right in key_pairs
+                ],
+                "profile": profile,
+            }
+        )
+    return edges
+
+
+def _verified_join_paths(
+    plan: DatasetPlan,
+    context: ToolContext,
+) -> list[dict[str, Any]]:
+    source_ids = set(require_context_study(context).data_sources)
+    constraints, _constraint_issues = _normalized_value_constraints(plan, source_ids)
+    required_tables = _required_plan_tables(plan, constraints, source_ids)
+    if len(required_tables) != 1:
+        return []
+    source_name, tables = next(iter(required_tables.items()))
+    if len(tables) < 2:
+        return []
+    edges = _join_profile_edges(plan, context, source_name)
+    adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = {
+        table: [] for table in tables
+    }
+    for edge in edges:
+        left = edge["left_table"]
+        right = edge["right_table"]
+        adjacency.setdefault(left, []).append((right, edge))
+        adjacency.setdefault(right, []).append(
             (
-                "Every selected table must belong to one connected set of "
-                "explicit, evidence-backed join operations before review."
+                left,
+                {
+                    **edge,
+                    "left_table": right,
+                    "right_table": left,
+                    "key_pairs": [
+                        {
+                            "left_column": pair["right_column"],
+                            "right_column": pair["left_column"],
+                        }
+                        for pair in edge["key_pairs"]
+                    ],
+                },
+            )
+        )
+    root = sorted(tables)[0]
+    paths: list[dict[str, Any]] = []
+    for target in sorted(tables - {root}):
+        queue = deque([(root, [])])
+        visited = {root}
+        found: list[dict[str, Any]] | None = None
+        while queue:
+            current, path_edges = queue.popleft()
+            if current == target:
+                found = path_edges
+                break
+            if len(path_edges) >= 3:
+                continue
+            for neighbor, edge in sorted(
+                adjacency.get(current, []),
+                key=lambda item: (item[0], item[1]["left_table"], item[1]["right_table"]),
+            ):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append((neighbor, [*path_edges, edge]))
+        if found is None:
+            return []
+        paths.extend(found)
+    unique_paths: list[dict[str, Any]] = []
+    seen_paths: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    for edge in paths:
+        key = (
+            edge["left_table"],
+            edge["right_table"],
+            tuple(
+                (pair["left_column"], pair["right_column"])
+                for pair in edge["key_pairs"]
             ),
         )
+        if key not in seen_paths:
+            seen_paths.add(key)
+            unique_paths.append(edge)
+    return unique_paths
 
 
 def _validate_dataset_plan(
@@ -1843,204 +1819,122 @@ def _validate_dataset_plan(
         kind=reference.kind,
     )
     plan = DatasetPlan.model_validate(stored.content)
-    issues: list[dict[str, Any]] = []
-    if not plan.row_definition.strip():
-        _collect_plan_check(
-            issues,
-            lambda: _raise_plan_error(
-                "PLAN_ROW_DEFINITION_MISSING",
-                "Dataset plan requires a non-empty row definition.",
-            ),
-            path="row_definition",
+    source_ids = set(require_context_study(context).data_sources)
+    constraints, issues = _normalized_value_constraints(plan, source_ids)
+
+    if not any(concept.fields for concept in plan.concepts):
+        error = ToolExecutionError(
+            "PLAN_FIELD_UNAVAILABLE",
+            "Dataset plan contains no requested concept field to validate.",
+            recoverable=True,
         )
-    if plan.unresolved:
-        _collect_plan_check(
-            issues,
-            lambda: _raise_plan_error(
-                "PLAN_UNRESOLVED",
-                "Dataset plan still contains unresolved items.",
-            ),
-            path="unresolved",
-        )
-    for field_index, field in enumerate(plan.required_fields):
-        _collect_plan_check(
-            issues,
-            lambda field=field, path=f"required_fields[{field_index}]": _validate_plan_field_role(
-                field,
-                required_role="identifier",
-                path=path,
-            ),
-            path=f"required_fields[{field_index}]",
-            source=field.source,
-            table=field.table,
-            column=field.column,
-        )
-    for concept_index, concept in enumerate(plan.concepts):
-        for field_index, field in enumerate(concept.fields):
-            path = f"concepts[{concept_index}].fields[{field_index}]"
-            _collect_plan_check(
-                issues,
-                lambda field=field, path=path: _validate_plan_field_role(
-                    field,
-                    required_role="requested",
-                    path=path,
-                ),
-                path=path,
-                source=field.source,
-                table=field.table,
-                column=field.column,
+        issues.append(_plan_issue(error, path="concepts"))
+
+    for source, table, column, path in _plan_fact_references(
+        plan,
+        constraints,
+        source_ids,
+    ):
+        details = {"source": source, "table": table, "column": column}
+        if source not in source_ids:
+            error = ToolExecutionError(
+                "PLAN_FIELD_UNAVAILABLE",
+                f"Runtime source is unavailable: {source}.",
+                recoverable=True,
+                details={**details, "reason": "source"},
             )
-    for reduction_index, reduction in enumerate(plan.reductions):
-        _collect_plan_check(
-            issues,
-            lambda reduction=reduction: _validate_plan_reduction(
-                reduction,
-                context=context,
-            ),
-            path=f"reductions[{reduction_index}]",
-        )
-    for concept_index, concept in enumerate(plan.concepts):
-        if not concept.fields:
-            _collect_plan_check(
-                issues,
-                lambda: _raise_plan_error(
-                    "PLAN_CONCEPT_UNASSIGNED",
-                    (
-                        "Every requested analysis concept requires at least one "
-                        "runtime field assignment before review."
-                    ),
-                ),
-                path=f"concepts[{concept_index}].fields",
+            issues.append(_plan_issue(error, path=path))
+            continue
+        if not table or not column or not _catalog_field_exists(context, table, column):
+            error = ToolExecutionError(
+                "PLAN_FIELD_UNAVAILABLE",
+                f"Runtime field is unavailable: {table}.{column}.",
+                recoverable=True,
+                details={**details, "reason": "table_or_column"},
             )
+            issues.append(_plan_issue(error, path=path))
 
-    field_specs = [
-        (field, f"required_fields[{field_index}]")
-        for field_index, field in enumerate(plan.required_fields)
-    ]
-    field_specs.extend(
-        (
-            field,
-            f"concepts[{concept_index}].fields[{field_index}]",
-        )
-        for concept_index, concept in enumerate(plan.concepts)
-        for field_index, field in enumerate(concept.fields)
-    )
-    if any(field.aggregation for field in plan.required_fields):
-        _collect_plan_check(
-            issues,
-            lambda: _raise_plan_error(
-                "PLAN_IDENTITY_AGGREGATION_INVALID",
-                "Required identity fields cannot be aggregated.",
-            ),
-            path="required_fields",
-        )
-    field_keys = _plan_reference_keys(plan)
-    output_sources: dict[str, tuple[str, str, str]] = {}
-    for field, path in field_specs:
-
-        def validate_field(field: PlanField = field) -> None:
-            field_details = {
-                "source": field.source,
-                "table": field.table,
-                "column": field.column,
-            }
-            if field.source not in require_context_study(context).data_sources:
-                _raise_plan_error(
-                    "PLAN_SOURCE_UNAVAILABLE",
-                    f"Plan field references unavailable source {field.source}.",
-                    details=field_details,
+    for constraint in constraints:
+        source = str(constraint.get("source") or "").strip()
+        table = str(constraint.get("table") or "").strip()
+        column = str(constraint.get("column") or "").strip()
+        operator = str(constraint.get("operator") or "").strip().casefold()
+        path = str(constraint.get("path") or "filters")
+        try:
+            database_path = _source_database_path(context, source)
+            for value_index, value in enumerate(_filter_constraint_values(constraint)):
+                if not _filter_value_exists(
+                    database_path=database_path,
+                    table=table,
+                    column=column,
+                    operator=operator,
+                    value=value,
+                ):
+                    error = ToolExecutionError(
+                        "PLAN_FILTER_VALUE_UNAVAILABLE",
+                        f"Stored filter value is unavailable for {table}.{column}.",
+                        recoverable=True,
+                        details={
+                            "source": source,
+                            "table": table,
+                            "column": column,
+                            "operator": operator,
+                            "value_index": value_index,
+                        },
+                    )
+                    issues.append(_plan_issue(error, path=path))
+        except (ToolExecutionError, duckdb.Error, OSError) as error:
+            if isinstance(error, ToolExecutionError):
+                tool_error = error
+            else:
+                tool_error = ToolExecutionError(
+                    "PLAN_FILTER_VALUE_UNAVAILABLE",
+                    f"Filter value could not be checked for {table}.{column}.",
+                    recoverable=True,
+                    details={
+                        "source": source,
+                        "table": table,
+                        "column": column,
+                        "operator": operator,
+                    },
                 )
-            if not _catalog_field_exists(context, field.table, field.column):
-                _raise_plan_error(
-                    "PLAN_FIELD_UNAVAILABLE",
-                    f"Runtime field is unavailable: {field.table}.{field.column}.",
-                    details=field_details,
-                )
-            field_key = (field.source, field.table, field.column)
-            output_name = str(field.output_column or field.column).strip()
-            prior_source = output_sources.get(output_name)
-            if prior_source is not None and prior_source != field_key:
-                _raise_plan_error(
-                    "PLAN_OUTPUT_NAME_CONFLICT",
-                    f"Multiple source fields produce output column {output_name}.",
-                    details={**field_details, "output_column": output_name},
-                )
-            output_sources[output_name] = field_key
+            issues.append(_plan_issue(tool_error, path=path))
 
-        _collect_plan_check(
-            issues,
-            validate_field,
-            path=path,
-            source=field.source,
-            table=field.table,
-            column=field.column,
-        )
+    if not any(issue["code"] == "PLAN_FIELD_UNAVAILABLE" for issue in issues):
+        required_tables = _required_plan_tables(plan, constraints, source_ids)
+        if len(required_tables) > 1:
+            error = ToolExecutionError(
+                "PLAN_JOIN_UNAVAILABLE",
+                "Required fields and filters span multiple runtime sources.",
+                recoverable=True,
+                details={"sources": sorted(required_tables)},
+            )
+            issues.append(_plan_issue(error, path="tables"))
+        elif required_tables:
+            source_name, tables = next(iter(required_tables.items()))
+            if len(tables) > 1:
+                try:
+                    paths = _verified_join_paths(plan, context)
+                except ToolExecutionError as error:
+                    paths = []
+                    issues.append(_plan_issue(error, path="operations"))
+                if not paths:
+                    error = ToolExecutionError(
+                        "PLAN_JOIN_UNAVAILABLE",
+                        "Required runtime tables have no observed non-null join path.",
+                        recoverable=True,
+                        details={
+                            "source": source_name,
+                            "tables": sorted(tables),
+                        },
+                    )
+                    issues.append(_plan_issue(error, path="operations"))
 
-    for source, table, column in sorted(field_keys):
-        def validate_reference(
-            source: str = source,
-            table: str = table,
-            column: str = column,
-        ) -> None:
-            reference_details = {
-                "source": source,
-                "table": table,
-                "column": column,
-            }
-            if source not in require_context_study(context).data_sources:
-                _raise_plan_error(
-                    "PLAN_SOURCE_UNAVAILABLE",
-                    f"Plan reference uses unavailable source {source}.",
-                    details=reference_details,
-                )
-            if not _catalog_field_exists(context, table, column):
-                _raise_plan_error(
-                    "PLAN_FIELD_UNAVAILABLE",
-                    f"Runtime field is unavailable: {table}.{column}.",
-                    details=reference_details,
-                )
-
-        _collect_plan_check(
-            issues,
-            validate_reference,
-            path=f"references[{source}.{table}.{column}]",
-            source=source,
-            table=table,
-            column=column,
-        )
-
-    _collect_plan_check(
-        issues,
-        lambda: _resolve_plan_filter_references(plan.filters, field_keys),
-        path="filters",
-    )
-    for filter_index, filter_entry in enumerate(plan.filters):
-        _collect_plan_check(
-            issues,
-            lambda filter_entry=filter_entry: _validate_plan_filter_contract([filter_entry]),
-            path=f"filters[{filter_index}]",
-        )
-
-    for operation_index, operation in enumerate(plan.operations):
-        _collect_plan_check(
-            issues,
-            lambda operation=operation: _validate_operation(
-                operation.model_dump(mode="json"),
-                context=context,
-                plan_fields=field_keys,
-            ),
-            path=f"operations[{operation_index}]",
-        )
-    _collect_plan_check(
-        issues,
-        lambda: _validate_plan_table_graph(plan, plan_fields=field_keys),
-        path="operations",
-    )
     _raise_collected_plan_errors(issues)
     return ToolResult(
         message=(
-            f"Dataset plan version {reference.version} passed deterministic "
-            "runtime validation."
+            f"Dataset plan version {reference.version} passed runtime fact "
+            "validation (fields, filter values, and join feasibility)."
         ),
         artifacts=(reference,),
     )
