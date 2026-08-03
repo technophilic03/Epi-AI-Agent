@@ -1529,6 +1529,21 @@ def _normalized_value_constraints(
     plan: DatasetPlan,
     source_ids: set[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    plan_sources = {
+        str(field.source or "").strip()
+        for field in [
+            *plan.required_fields,
+            *(field for concept in plan.concepts for field in concept.fields),
+        ]
+        if str(field.source or "").strip()
+    }
+    inferred_source = (
+        next(iter(plan_sources))
+        if len(plan_sources) == 1
+        else next(iter(source_ids))
+        if len(source_ids) == 1
+        else ""
+    )
     constraints: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
     for filter_index, filter_entry in enumerate(plan.filters):
@@ -1555,8 +1570,8 @@ def _normalized_value_constraints(
             constraint = dict(raw_constraint)
             constraint["path"] = path
             source = str(constraint.get("source") or "").strip()
-            if not source and len(source_ids) == 1:
-                constraint["source"] = next(iter(source_ids))
+            if not source and inferred_source:
+                constraint["source"] = inferred_source
             table = str(constraint.get("table") or "").strip()
             column = str(constraint.get("column") or "").strip()
             operator = str(constraint.get("operator") or "").strip().casefold()

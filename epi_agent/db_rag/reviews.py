@@ -2,16 +2,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections import deque
 from typing import Any
 
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from db_rag.filter_references import (
-    FilterReferenceResolutionError,
-    resolve_filter_references,
-)
 from db_rag.review_contracts import (
     _build_grouped_review,
     _column_key,
@@ -57,19 +52,6 @@ def _field_ref(value: Any) -> tuple[str, str, str]:
     )
 
 
-def _field_roles(value: Any) -> set[str]:
-    field = _field_dict(value)
-    return {
-        str(role or "").strip().casefold()
-        for role in list(field.get("roles") or [])
-        if str(role or "").strip()
-    }
-
-
-def _is_optional_requested_field(value: Any) -> bool:
-    return _field_roles(value) == {"requested"}
-
-
 def _concept_fields(concept: Any) -> list[dict[str, Any]]:
     content = _field_dict(concept)
     return [
@@ -77,94 +59,6 @@ def _concept_fields(concept: Any) -> list[dict[str, Any]]:
         for field in list(content.get("fields") or [])
         if _field_dict(field)
     ]
-
-
-def _concept_field_refs(plan: DatasetPlan) -> set[tuple[str, str, str]]:
-    return {
-        _field_ref(field)
-        for concept in plan.concepts
-        for field in _concept_fields(concept)
-    }
-
-
-def _plan_field_refs(plan: DatasetPlan) -> set[tuple[str, str, str]]:
-    refs = _concept_field_refs(plan) | {
-        _field_ref(field)
-        for field in plan.required_fields
-    }
-    for filter_entry in plan.filters:
-        refs.update(_filter_field_refs(filter_entry))
-    for operation in plan.operations:
-        refs.update(
-            reference
-            for reference in (
-                _field_ref(value) for value in operation.field_refs
-            )
-            if all(reference)
-        )
-        if _operation_name(operation.model_dump(mode="json")) == "join":
-            source = str(operation.source or "").strip()
-            for pair in operation.key_pairs:
-                if source and operation.left_table:
-                    refs.add((source, operation.left_table, pair.left_column))
-                if source and operation.right_table:
-                    refs.add((source, operation.right_table, pair.right_column))
-    for reduction in plan.reductions:
-        refs.update(
-            (reference.source, reference.table, reference.column)
-            for reference in [
-                *reduction.group_by,
-                reduction.order_by,
-                *reduction.tie_breakers,
-            ]
-            if reference is not None
-        )
-        refs.update(
-            (
-                aggregate.field.source,
-                aggregate.field.table,
-                aggregate.field.column,
-            )
-            for aggregate in reduction.aggregates
-        )
-    return refs
-
-
-def _filter_field_refs(
-    filter_entry: dict[str, Any],
-) -> set[tuple[str, str, str]]:
-    refs: set[tuple[str, str, str]] = set()
-    for value in [
-        *list(filter_entry.get("referenced_columns") or []),
-        *list(filter_entry.get("value_constraints") or []),
-    ]:
-        reference = _field_ref(value)
-        if all(reference):
-            refs.add(reference)
-    return refs
-
-
-def _conditional_filter_refs(
-    filter_entry: dict[str, Any],
-    *,
-    concept_fields: set[tuple[str, str, str]],
-) -> set[tuple[str, str, str]]:
-    refs = _filter_field_refs(filter_entry)
-    return refs if refs and refs.issubset(concept_fields) else set()
-
-
-def _resolved_plan_filters(plan: DatasetPlan) -> list[dict[str, Any]]:
-    try:
-        return resolve_filter_references(
-            plan.filters,
-            available_fields=_plan_field_refs(plan),
-        )
-    except FilterReferenceResolutionError as error:
-        raise ToolExecutionError(
-            error.code,
-            str(error),
-            recoverable=True,
-        ) from error
 
 
 def _safe_filter_value(value: Any) -> Any:
@@ -186,8 +80,19 @@ def _safe_filter_value(value: Any) -> Any:
 
 def _review_filters(plan: DatasetPlan) -> list[dict[str, Any]]:
     presented: list[dict[str, Any]] = []
-    concept_fields = _concept_field_refs(plan)
-    for value in _resolved_plan_filters(plan):
+    source_ids = {
+        str(field.source or "").strip()
+        for field in [
+            *plan.required_fields,
+            *(field for concept in plan.concepts for field in concept.fields),
+        ]
+        if str(field.source or "").strip()
+    }
+    if len(source_ids) == 1:
+        default_source = next(iter(source_ids))
+    else:
+        default_source = ""
+    for value in plan.filters:
         item: dict[str, Any] = {}
         for key in ("description", "predicate"):
             raw_text = value.get(key)
@@ -197,6 +102,8 @@ def _review_filters(plan: DatasetPlan) -> list[dict[str, Any]]:
         references: list[dict[str, str]] = []
         for reference in value.get("referenced_columns") or []:
             source, table, column = _field_ref(reference)
+            if not source:
+                source = default_source
             references.append(
                 {"source": source, "table": table, "column": column}
             )
@@ -205,6 +112,8 @@ def _review_filters(plan: DatasetPlan) -> list[dict[str, Any]]:
         constraints: list[dict[str, Any]] = []
         for constraint in value.get("value_constraints") or []:
             source, table, column = _field_ref(constraint)
+            if not source:
+                source = default_source
             presented_constraint: dict[str, Any] = {
                 "source": source,
                 "table": table,
@@ -226,15 +135,6 @@ def _review_filters(plan: DatasetPlan) -> list[dict[str, Any]]:
             constraints.append(presented_constraint)
         if constraints:
             item["value_constraints"] = constraints
-        conditional_refs = _conditional_filter_refs(
-            value,
-            concept_fields=concept_fields,
-        )
-        if conditional_refs:
-            item["selection_keys"] = sorted(
-                "::".join(reference)
-                for reference in conditional_refs
-            )
         presented.append(item)
     return presented
 
@@ -250,22 +150,32 @@ def _review_payload(
     columns: list[dict[str, Any]] = []
     assignments: list[dict[str, Any]] = []
     clinical_concepts: list[dict[str, Any]] = []
+    seen_fields: set[tuple[str, str, str]] = set()
     for concept in concepts:
         concept_id = str(
             concept.get("concept_id") or concept.get("id") or ""
         ).strip()
         label = str(concept.get("label") or concept_id).strip()
         fields = _concept_fields(concept)
+        presented_fields: list[dict[str, Any]] = []
         for field in fields:
-            columns.append(
-                {
-                    **field,
-                    "description": str(
-                        field.get("description") or label
-                    ).strip(),
-                    "required": not _is_optional_requested_field(field),
-                }
-            )
+            reference = _field_ref(field)
+            if not all(reference) or reference in seen_fields:
+                continue
+            seen_fields.add(reference)
+            presented = {
+                **field,
+                "roles": ["requested"],
+                "description": str(
+                    field.get("description") or label
+                ).strip(),
+                "required": False,
+                "key": _column_key(field),
+            }
+            columns.append(presented)
+            presented_fields.append(presented)
+        if not presented_fields:
+            continue
         clinical_concepts.append(
             {
                 "concept_id": concept_id,
@@ -278,7 +188,7 @@ def _review_payload(
         assignments.append(
             {
                 "concept_id": concept_id,
-                "columns": fields,
+                "columns": presented_fields,
                 "unresolved_reason": "",
             }
         )
@@ -389,222 +299,27 @@ def _operation_key_pairs(
     return pairs
 
 
-def _required_join_operation_indexes(
-    operations: list[dict[str, Any]],
-    selected_tables: list[tuple[str, str]],
-) -> set[int]:
-    edges: list[tuple[int, tuple[str, str], tuple[str, str]]] = []
-    adjacency: dict[
-        tuple[str, str],
-        list[tuple[int, tuple[str, str]]],
-    ] = {}
-    for index, operation in enumerate(operations):
-        if _operation_name(operation) != "join":
-            continue
-        source = str(operation.get("source") or "").strip()
-        left = _table_ref(source, operation.get("left_table"))
-        right = _table_ref(source, operation.get("right_table"))
-        if not all(left) or not all(right) or not _operation_key_pairs(operation):
-            continue
-        edges.append((index, left, right))
-        adjacency.setdefault(left, []).append((index, right))
-        adjacency.setdefault(right, []).append((index, left))
-
-    for neighbors in adjacency.values():
-        neighbors.sort(key=lambda item: item[0])
-
-    terminals = list(dict.fromkeys(selected_tables))
-    if len(terminals) < 2:
-        return set()
-
-    terminal_set = set(terminals)
-    retained = {
-        index
-        for index, left, right in edges
-        if left in terminal_set and right in terminal_set
-    }
-    connected = {terminals[0]}
-    for target in terminals[1:]:
-        queue = deque(
-            (node, [])
-            for node in sorted(
-                connected,
-                key=lambda node: (
-                    terminals.index(node)
-                    if node in terminals
-                    else len(terminals)
-                ),
-            )
-        )
-        visited = set(connected)
-        path: list[int] | None = None
-        while queue:
-            node, operation_path = queue.popleft()
-            if node == target:
-                path = operation_path
-                break
-            for operation_index, neighbor in adjacency.get(node, []):
-                if neighbor in visited:
-                    continue
-                visited.add(neighbor)
-                queue.append((neighbor, [*operation_path, operation_index]))
-        if path is None:
-            continue
-        retained.update(path)
-        for operation_index in path:
-            _, left, right = next(
-                edge for edge in edges if edge[0] == operation_index
-            )
-            connected.update((left, right))
-        connected.add(target)
-    return retained
-
-
-def _required_join_fields(
-    operations: list[dict[str, Any]],
-    retained_join_indexes: set[int],
-) -> set[tuple[str, str, str]]:
-    required: set[tuple[str, str, str]] = set()
-    for index in retained_join_indexes:
-        operation = operations[index]
-        source = str(operation.get("source") or "").strip()
-        left_table = str(operation.get("left_table") or "").strip()
-        right_table = str(operation.get("right_table") or "").strip()
-        required.update(
-            (source, left_table, left_column)
-            for left_column, _ in _operation_key_pairs(operation)
-        )
-        required.update(
-            (source, right_table, right_column)
-            for _, right_column in _operation_key_pairs(operation)
-        )
-        required.update(
-            field_ref
-            for field_ref in (
-                _field_ref(value)
-                for value in operation.get("field_refs") or []
-            )
-            if all(field_ref)
-        )
-    return required
-
-
-def _retained_filters(
-    filters: list[dict[str, Any]],
-    *,
-    selected_concept_fields: set[tuple[str, str, str]],
-    concept_fields: set[tuple[str, str, str]],
-) -> list[dict[str, Any]]:
-    retained: list[dict[str, Any]] = []
-    for value in filters:
-        filter_entry = dict(value)
-        conditional_refs = _conditional_filter_refs(
-            filter_entry,
-            concept_fields=concept_fields,
-        )
-        if conditional_refs and not conditional_refs.issubset(
-            selected_concept_fields
-        ):
-            continue
-        retained.append(filter_entry)
-    return retained
-
-
-def _non_join_operation_field_refs(
-    operations: list[dict[str, Any]],
-    *,
-    selected_concept_fields: set[tuple[str, str, str]],
-    concept_fields: set[tuple[str, str, str]],
-) -> set[tuple[str, str, str]]:
-    refs: set[tuple[str, str, str]] = set()
-    removed_concept_fields = concept_fields - selected_concept_fields
-    for operation in operations:
-        if _operation_name(operation) == "join":
-            continue
-        refs.update(
-            reference
-            for reference in (
-                _field_ref(value)
-                for value in operation.get("field_refs") or []
-            )
-            if all(reference) and reference not in removed_concept_fields
-        )
-    return refs
-
-
-def _dependency_closure(
-    plan: DatasetPlan,
-    *,
-    selected_concept_fields: set[tuple[str, str, str]],
-    selected_optional_refs: set[tuple[str, str, str]],
-) -> tuple[
-    list[dict[str, Any]],
-    set[int],
-    set[tuple[str, str, str]],
-    set[tuple[str, str, str]],
-]:
-    concept_fields = {
-        _field_ref(field)
-        for concept in plan.concepts
-        for field in _concept_fields(concept)
-    }
-    operations = [
-        operation.model_dump(mode="json") for operation in plan.operations
-    ]
-    filters = _retained_filters(
-        _resolved_plan_filters(plan),
-        selected_concept_fields=selected_concept_fields,
-        concept_fields=concept_fields,
-    )
-    filter_refs = {
-        reference
-        for filter_entry in filters
-        for reference in _filter_field_refs(filter_entry)
-    }
-    operation_refs = _non_join_operation_field_refs(
-        operations,
-        selected_concept_fields=selected_concept_fields,
-        concept_fields=concept_fields,
-    )
-    required_identity_refs = {
-        _field_ref(field) for field in plan.required_fields
-    }
-    supporting_refs = filter_refs | operation_refs
-    anchor_fields = (
-        selected_concept_fields
-        | required_identity_refs
-        | supporting_refs
-        | selected_optional_refs
-    )
-    anchor_tables = [reference[:2] for reference in anchor_fields]
-    retained_join_indexes = _required_join_operation_indexes(
-        operations,
-        anchor_tables,
-    )
-    join_refs = _required_join_fields(operations, retained_join_indexes)
-    return (
-        filters,
-        retained_join_indexes,
-        supporting_refs | join_refs,
-        selected_optional_refs,
-    )
-
-
 def _required_fields_payload(
     plan: DatasetPlan,
 ) -> list[dict[str, Any]]:
-    return [
-        {
-            **content,
-            "key": _column_key(content),
-            "label": "Required identifier",
-            "required": True,
-        }
-        for field in [
-            *plan.required_fields,
-        ]
-        for content in [field.model_dump(mode="json")]
-    ]
+    presented: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for field in plan.required_fields:
+        content = field.model_dump(mode="json")
+        reference = _field_ref(content)
+        if not all(reference) or reference in seen:
+            continue
+        seen.add(reference)
+        presented.append(
+            {
+                **content,
+                "roles": ["identifier"],
+                "key": _column_key(content),
+                "label": "Required identifier",
+                "required": True,
+            }
+        )
+    return presented
 
 
 def _relationship_profiles(content: dict[str, Any]) -> list[dict[str, Any]]:
@@ -749,6 +464,7 @@ def _data_linkage_payload(
     context: ToolContext,
 ) -> dict[str, Any]:
     relationships: list[dict[str, Any]] = []
+    shown_edges: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
     for value in plan.operations:
         operation = value.model_dump(mode="json")
         if _operation_name(operation) != "join":
@@ -776,6 +492,19 @@ def _data_linkage_payload(
                 for left_column, right_column in _operation_key_pairs(operation)
             ],
         }
+        shown_edges.add(
+            (
+                relationship["left_table"],
+                relationship["right_table"],
+                tuple(
+                    (
+                        pair["left_column"],
+                        pair["right_column"],
+                    )
+                    for pair in relationship["key_pairs"]
+                ),
+            )
+        )
         profile = _matching_profile(operation, context)
         if profile:
             left_cardinality = str(
@@ -809,6 +538,70 @@ def _data_linkage_payload(
                 }
             )
         relationships.append(relationship)
+    try:
+        from epi_agent.db_rag.tools import _verified_join_paths
+
+        for edge in _verified_join_paths(plan, context):
+            profile = edge.get("profile")
+            key_pairs = list(edge.get("key_pairs") or [])
+            edge_key = (
+                str(edge.get("left_table") or ""),
+                str(edge.get("right_table") or ""),
+                tuple(
+                    (
+                        str(pair.get("left_column") or ""),
+                        str(pair.get("right_column") or ""),
+                    )
+                    for pair in key_pairs
+                ),
+            )
+            if edge_key in shown_edges:
+                continue
+            shown_edges.add(edge_key)
+            relationship = {
+                "description": "",
+                "source": str(edge.get("source") or "").strip(),
+                "evidence_label": "Profiled relationship risk",
+                "join_type": "",
+                "join_strategy_label": "",
+                "left_table": edge_key[0],
+                "right_table": edge_key[1],
+                "key_pairs": key_pairs,
+            }
+            if profile is not None:
+                left_cardinality = str(
+                    getattr(profile, "left_cardinality", "") or ""
+                ).strip()
+                right_cardinality = str(
+                    getattr(profile, "right_cardinality", "") or ""
+                ).strip()
+                relationship.update(
+                    {
+                        "left_cardinality": left_cardinality,
+                        "right_cardinality": right_cardinality,
+                        "cardinality_label": _cardinality_label(
+                            edge_key[0],
+                            edge_key[1],
+                            left_cardinality,
+                            right_cardinality,
+                        ),
+                        "warnings": [
+                            {
+                                "code": str(code),
+                                "label": _warning_label(
+                                    str(code),
+                                    edge_key[0],
+                                    edge_key[1],
+                                ),
+                            }
+                            for code in getattr(profile, "warnings", [])
+                            if str(code).strip()
+                        ],
+                    }
+                )
+            relationships.append(relationship)
+    except (ToolExecutionError, KeyError, ValueError):
+        pass
     return {"relationships": relationships}
 
 
@@ -817,80 +610,33 @@ def _selected_plan(
     selected_column_keys: list[Any] | None,
 ) -> DatasetPlan:
     if selected_column_keys is None:
-        resolved_filters = _resolved_plan_filters(plan)
-        if resolved_filters == plan.filters:
-            return plan
-        return DatasetPlan.model_validate(
-            {
-                **plan.model_dump(mode="json"),
-                "filters": resolved_filters,
-            }
-        )
-
-    selected_keys = {
-        str(key or "").strip().casefold()
-        for key in selected_column_keys
-        if str(key or "").strip()
+        return plan
+    selected = {
+        str(value or "").strip().casefold()
+        for value in selected_column_keys
+        if str(value or "").strip()
     }
-    selected_fields: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     concepts: list[dict[str, Any]] = []
     for concept in plan.concepts:
         content = concept.model_dump(mode="json")
-        fields = [
-            field
-            for field in _concept_fields(content)
-            if not _is_optional_requested_field(field)
-            or _column_key(field).casefold() in selected_keys
-        ]
+        fields: list[dict[str, Any]] = []
+        for field in _concept_fields(content):
+            reference = _field_ref(field)
+            if (
+                _column_key(field).casefold() not in selected
+                or not all(reference)
+                or reference in seen
+            ):
+                continue
+            seen.add(reference)
+            fields.append(field)
         if fields:
             concepts.append({**content, "fields": fields})
-            for field in fields:
-                reference = _field_ref(field)
-                selected_fields.add(reference)
-
-    operation_values = [
-        operation.model_dump(mode="json") for operation in plan.operations
-    ]
-    selected_optional_refs: set[tuple[str, str, str]] = set()
-    (
-        filters,
-        retained_join_indexes,
-        required_supporting_fields,
-        _selected_optional_fields,
-    ) = _dependency_closure(
-        plan,
-        selected_concept_fields=selected_fields,
-        selected_optional_refs=selected_optional_refs,
-    )
-    retained_fields = (
-        selected_fields
-        | required_supporting_fields
-        | {_field_ref(field) for field in plan.required_fields}
-    )
-    operations: list[dict[str, Any]] = []
-    for index, content in enumerate(operation_values):
-        is_join = _operation_name(content) == "join"
-        if is_join and index not in retained_join_indexes:
-            continue
-        original_field_refs = list(content.get("field_refs") or [])
-        if original_field_refs:
-            content["field_refs"] = [
-                field
-                for field in original_field_refs
-                if _field_ref(field) in retained_fields
-            ]
-            if not is_join and not content["field_refs"]:
-                continue
-        elif not is_join and not selected_fields:
-            continue
-        operations.append(content)
-
     return DatasetPlan.model_validate(
         {
             **plan.model_dump(mode="json"),
             "concepts": concepts,
-            "operations": operations,
-            "filters": filters,
         }
     )
 
