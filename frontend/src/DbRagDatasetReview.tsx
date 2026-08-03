@@ -122,7 +122,6 @@ export default function DbRagDatasetReview({
     >
       <header className="db-rag-dataset-review-header">
         <h2 id="db-rag-dataset-review-heading">Review extracted dataset</h2>
-        <p>Dataset ID: {datasetId}</p>
         <p>{view.dimensions.rows ?? "Unknown"} rows</p>
         <p>{view.dimensions.columns ?? "Unknown"} columns</p>
       </header>

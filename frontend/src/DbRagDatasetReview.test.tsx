@@ -175,7 +175,7 @@ describe("DbRagDatasetReview", () => {
       />,
     );
 
-    expect(screen.getByText("Dataset ID: subset-1")).toBeInTheDocument();
+    expect(screen.queryByText("Dataset ID: subset-1")).not.toBeInTheDocument();
     expect(screen.getByText("Create an index-case analysis dataset."))
       .toBeInTheDocument();
     expect(screen.getByText("Use baseline rows.")).toBeInTheDocument();

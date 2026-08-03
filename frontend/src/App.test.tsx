@@ -2794,7 +2794,7 @@ describe("App", () => {
       await screen.findByRole("heading", { name: "Review extracted dataset" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("male")).toBeInTheDocument();
-    expect(screen.getByText("Dataset ID: pending-subset")).toBeInTheDocument();
+    expect(screen.queryByText("Dataset ID: pending-subset")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("region", { name: "Generated datasets" }),
     ).not.toBeInTheDocument();
