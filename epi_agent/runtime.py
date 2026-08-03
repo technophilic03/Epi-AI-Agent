@@ -48,6 +48,10 @@ from utils.runtime_defaults import DEFAULT_EPI_AGENT_MAX_ITERATIONS
 
 
 _REPEATED_FAILURE_LIMIT = 2
+_SQL_REPAIR_ERROR_CODE = "SQL_REPAIR_REQUIRED"
+_SQL_REPAIR_EXHAUSTED_CODE = "SQL_REPAIR_BUDGET_EXHAUSTED"
+_SQL_REPAIR_TOOL_NAME = "dbrag-validate_and_extract"
+_SQL_REPAIR_CANDIDATE_LIMIT = 5
 _LOGGER = logging.getLogger(__name__)
 _DATASET_ARTIFACT_KINDS = {
     "analysis_dataset",
@@ -148,7 +152,42 @@ def _tool_error_content(error: ToolExecutionError) -> str:
     return json.dumps({"error": error_payload}, sort_keys=True)
 
 
+def _failure_record(signature: str) -> dict[str, Any]:
+    try:
+        value = json.loads(signature)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _sql_repair_attempts(signatures: list[str]) -> int:
+    return len(_sql_repair_failure_signatures(signatures))
+
+
+def _sql_repair_failure_signatures(signatures: list[str]) -> list[str]:
+    matching: list[str] = []
+    for signature in signatures:
+        record = _failure_record(signature)
+        if (
+            record.get("code") == _SQL_REPAIR_ERROR_CODE
+            and record.get("tool") == _SQL_REPAIR_TOOL_NAME
+        ):
+            matching.append(signature)
+    return matching
+
+
+def _sql_repair_budget_exhausted(signatures: list[str]) -> bool:
+    return _sql_repair_attempts(signatures) >= _SQL_REPAIR_CANDIDATE_LIMIT
+
+
 def _repeated_failure(signatures: list[str]) -> bool:
+    if signatures:
+        latest = _failure_record(signatures[-1])
+        if (
+            latest.get("code") == _SQL_REPAIR_ERROR_CODE
+            and latest.get("tool") == _SQL_REPAIR_TOOL_NAME
+        ):
+            return False
     return len(signatures) >= _REPEATED_FAILURE_LIMIT and all(
         item == signatures[-1] for item in signatures[-_REPEATED_FAILURE_LIMIT:]
     )
@@ -293,6 +332,24 @@ def _prepare_model_request(
         continuation_messages.append(
             SystemMessage(
                 content="Continue the same response from where it stopped."
+            )
+        )
+    if _sql_repair_budget_exhausted(failures):
+        continuation_messages.append(
+            SystemMessage(
+                content=json.dumps(
+                    {
+                        "code": _SQL_REPAIR_EXHAUSTED_CODE,
+                        "instruction": (
+                            "The initial SQL candidate and repairs 1 through 4 "
+                            "were rejected. Do not call any tool. Explain the "
+                            "final SQL diagnostic to the user, including that "
+                            "no rejected SQL was executed."
+                        ),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
             )
         )
     budget = (
@@ -787,11 +844,62 @@ def _execute_tools(
     for call in calls:
         name = call["name"]
         arguments = call["args"]
+        if (
+            name == _SQL_REPAIR_TOOL_NAME
+            and _sql_repair_budget_exhausted(failures)
+        ):
+            error = ToolExecutionError(
+                _SQL_REPAIR_EXHAUSTED_CODE,
+                (
+                    "The initial SQL candidate and repairs 1 through 4 were "
+                    "already rejected; a sixth candidate was not executed."
+                ),
+                recoverable=False,
+                details={
+                    "max_candidate_attempts": _SQL_REPAIR_CANDIDATE_LIMIT,
+                    "candidate_attempt": _SQL_REPAIR_CANDIDATE_LIMIT + 1,
+                    "repairs_remaining": 0,
+                    "executed": False,
+                },
+            )
+            messages.append(
+                ToolMessage(
+                    content=_tool_error_content(error),
+                    tool_call_id=call["id"],
+                    name=name,
+                    status="error",
+                )
+            )
+            terminal_error = _terminal_error(error.code, str(error))
+            break
         try:
             result = agent_config.registry.invoke(name, arguments, context=context)
         except GraphInterrupt:
             raise
         except ToolExecutionError as error:
+            if (
+                name == _SQL_REPAIR_TOOL_NAME
+                and error.code == _SQL_REPAIR_ERROR_CODE
+            ):
+                candidate_attempt = _sql_repair_attempts(failures) + 1
+                details = dict(error.details or {})
+                details.update(
+                    {
+                        "candidate_attempt": candidate_attempt,
+                        "max_candidate_attempts": _SQL_REPAIR_CANDIDATE_LIMIT,
+                        "repairs_remaining": max(
+                            0,
+                            _SQL_REPAIR_CANDIDATE_LIMIT - candidate_attempt,
+                        ),
+                        "executed": False,
+                    }
+                )
+                error = ToolExecutionError(
+                    error.code,
+                    str(error),
+                    recoverable=error.recoverable,
+                    details=details,
+                )
             messages.append(
                 ToolMessage(
                     content=_tool_error_content(error),
@@ -806,7 +914,11 @@ def _execute_tools(
                 break
             continue
 
-        failures = []
+        failures = (
+            []
+            if name == _SQL_REPAIR_TOOL_NAME
+            else _sql_repair_failure_signatures(failures)
+        )
         reducer_state = {**state, **tool_state_patch}
         tool_state_patch.update(
             agent_config.tool_success_state_reducer(
@@ -954,6 +1066,10 @@ def _execute_tools(
 
 
 def analysis_completion_issues(state: dict[str, Any]) -> list[str]:
+    if _sql_repair_budget_exhausted(
+        list(state.get("failure_signatures") or [])
+    ):
+        return []
     store = StateArtifactStore.from_state(state)
     current_refs = list(state.get("current_turn_artifact_refs") or [])
     latest_plan: ArtifactRef | None = None

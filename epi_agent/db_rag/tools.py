@@ -3881,7 +3881,7 @@ def build_db_rag_tool_registry() -> ToolRegistry:
                 "Compile and immediately validate and extract an approved "
                 "dataset plan. Omit sql for the deterministic first attempt. "
                 "After SQL_REPAIR_REQUIRED, submit repaired read-only SQL "
-                "against the same frozen plan."
+                "against the same frozen plan, using at most four repairs."
             ),
             ValidateAndExtractArguments,
             False,
