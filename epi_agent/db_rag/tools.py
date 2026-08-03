@@ -2520,6 +2520,23 @@ def _validated_sql_output_aliases(sql: str) -> list[str]:
     return aliases
 
 
+def _projected_aliases_are_covered(
+    expected: list[str],
+    physical: list[str],
+) -> bool:
+    expected_names = {
+        str(name).strip()
+        for name in expected
+        if str(name).strip()
+    }
+    physical_names = {
+        str(name).strip()
+        for name in physical
+        if str(name).strip()
+    }
+    return bool(expected_names) and expected_names.issubset(physical_names)
+
+
 def _dataset_persistence_lineage(
     context: ToolContext,
     *,
@@ -2783,11 +2800,17 @@ def _validate_canonical_dataset_lineage(
         raise _durable_collision(
             "Canonical dataset selected fields do not match the approved plan."
         )
-    if artifact.get("columns") != list(
-        lineage.get("expected_output_aliases") or []
-    ):
+    physical_columns = [
+        str(column).strip()
+        for column in list(artifact.get("columns") or [])
+    ]
+    expected_aliases = [
+        str(alias).strip()
+        for alias in list(lineage.get("expected_output_aliases") or [])
+    ]
+    if not _projected_aliases_are_covered(expected_aliases, physical_columns):
         raise _durable_collision(
-            "Canonical dataset output columns do not match validated SQL aliases."
+            "Canonical dataset is missing a projected SQL alias."
         )
     predecessor_id = lineage.get("predecessor_dataset_id")
     predecessor_version = lineage.get("predecessor_dataset_version")
