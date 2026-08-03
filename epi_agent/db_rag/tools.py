@@ -546,7 +546,7 @@ def _render_catalog(content: dict[str, Any]) -> dict[str, Any]:
         )
         if field
     ][:item_limit]
-    return {
+    rendered = {
         key: value
         for key, value in {
             "query": _bounded_text(content.get("query")),
@@ -566,6 +566,48 @@ def _render_catalog(content: dict[str, Any]) -> dict[str, Any]:
         }.items()
         if value not in ("", [], None)
     }
+    summary = content.get("retrieval_summary")
+    if isinstance(summary, dict):
+        probes: list[dict[str, Any]] = []
+        for value in summary.get("probes") or []:
+            if not isinstance(value, dict):
+                continue
+            probe: dict[str, Any] = {
+                "query": _bounded_text(value.get("query"), limit=500),
+            }
+            for key in (
+                "table_hits",
+                "column_hits",
+                "unique_table_count",
+                "unique_column_count",
+            ):
+                count = value.get(key)
+                if isinstance(count, int) and not isinstance(count, bool):
+                    probe[key] = max(0, count)
+            probes.append(probe)
+        safe_summary: dict[str, Any] = {
+            "probe_count": (
+                summary.get("probe_count")
+                if isinstance(summary.get("probe_count"), int)
+                and not isinstance(summary.get("probe_count"), bool)
+                else len(probes)
+            ),
+            "unique_table_count": (
+                summary.get("unique_table_count")
+                if isinstance(summary.get("unique_table_count"), int)
+                and not isinstance(summary.get("unique_table_count"), bool)
+                else 0
+            ),
+            "unique_column_count": (
+                summary.get("unique_column_count")
+                if isinstance(summary.get("unique_column_count"), int)
+                and not isinstance(summary.get("unique_column_count"), bool)
+                else 0
+            ),
+            "probes": probes[:_MAX_CATALOG_QUERIES],
+        }
+        rendered["retrieval_summary"] = safe_summary
+    return rendered
 
 
 def _render_relationship(content: dict[str, Any]) -> dict[str, Any]:
@@ -931,6 +973,9 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
         )
     source_ids = sorted(str(source_id) for source_id in study.data_sources)
     hits: list[dict[str, Any]] = []
+    all_tables: set[tuple[str, str]] = set()
+    all_columns: set[tuple[str, str, str]] = set()
+    probe_summaries: list[dict[str, Any]] = []
     provider_batches = search_many(queries, limit=limit)
     if len(provider_batches) != len(queries):
         raise ToolExecutionError(
@@ -939,6 +984,7 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
             recoverable=True,
         )
     for query, provider_hits in zip(queries, provider_batches):
+        normalized_hits: list[dict[str, Any]] = []
         for provider_hit in provider_hits:
             hit = _schema_evidence_hit(provider_hit)
             source = str(hit.get("source") or "").strip()
@@ -957,10 +1003,46 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
                     "source_id": source,
                 }
             hit["retrieval_probe"] = query
+            normalized_hits.append(hit)
             hits.append(hit)
+        probe_tables = {
+            (str(hit.get("source") or ""), str(hit.get("table") or ""))
+            for hit in normalized_hits
+            if str(hit.get("table") or "")
+        }
+        probe_columns = {
+            (
+                str(hit.get("source") or ""),
+                str(hit.get("table") or ""),
+                str(hit.get("column") or ""),
+            )
+            for hit in normalized_hits
+            if str(hit.get("table") or "") and str(hit.get("column") or "")
+        }
+        all_tables.update(probe_tables)
+        all_columns.update(probe_columns)
+        probe_summaries.append(
+            {
+                "query": query,
+                "table_hits": sum(
+                    1 for hit in normalized_hits if not hit.get("column")
+                ),
+                "column_hits": sum(
+                    1 for hit in normalized_hits if hit.get("column")
+                ),
+                "unique_table_count": len(probe_tables),
+                "unique_column_count": len(probe_columns),
+            }
+        )
     content = {
         "queries": queries,
         "source_ids": source_ids,
+        "retrieval_summary": {
+            "probe_count": len(queries),
+            "unique_table_count": len(all_tables),
+            "unique_column_count": len(all_columns),
+            "probes": probe_summaries,
+        },
         "hits": hits[:_MAX_CATALOG_HITS],
     }
     reference = _save_observation(
