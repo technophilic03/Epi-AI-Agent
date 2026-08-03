@@ -3,28 +3,20 @@
 This is a lightweight local demo of Epi AI Agent. It runs on macOS and Linux
 with Python 3.12 and an OpenAI API key.
 
-## Prerequisite: Python 3.12
-
-Confirm that the required Python version is available:
-
-```bash
-python3.12 --version
-```
-
-If the command is unavailable, install Python 3.12 with your system package
-manager. On macOS with Homebrew, run `brew install python@3.12`.
-
-Without Homebrew on macOS, download and install Python 3.12 from the
-[official Python macOS downloads page](https://www.python.org/downloads/macos/).
-
 ## Start the demo
 
 ```bash
+# Install uv if needed (macOS/Linux)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 git clone https://github.com/xutao-wang/Epi-AI-Agent.git
 cd Epi-AI-Agent
-python3.12 -m venv .venv
+
+uv python install 3.12
+uv venv --python 3.12
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+uv pip install -r requirements.txt
+
 cp .env.example .env
 python study_installer.py --study report-india-synthetic-0.2.0.tar.gz
 python run_fastapi.py
