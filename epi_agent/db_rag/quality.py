@@ -147,7 +147,10 @@ def _persisted_post_sql_warnings(
     provenance: dict[str, Any],
 ) -> list[QualityWarning]:
     warnings: list[QualityWarning] = []
-    for item in list(provenance.get("post_sql_warnings") or []):
+    raw_warnings = provenance.get("post_sql_warnings")
+    if not isinstance(raw_warnings, list):
+        return warnings
+    for item in raw_warnings:
         if not isinstance(item, dict):
             continue
         try:
