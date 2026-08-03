@@ -11,7 +11,7 @@ from utils.model_runtime_profiles import (
 
 AVAILABLE_OPENAI_MODELS = tuple(MODEL_RUNTIME_PROFILES)
 
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
+DEFAULT_OPENAI_MODEL = "gpt-5.6-terra"
 
 DEFAULT_TEMPERATURE = 0.0
 TEMPERATURE_RANGE = (0.0, 1.0)

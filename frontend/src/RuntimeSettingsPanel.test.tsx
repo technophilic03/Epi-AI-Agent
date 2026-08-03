@@ -51,7 +51,7 @@ const options: RuntimeOptions = {
     modelOption("gpt-5.4", "gpt-5.4 (Standard)", "standard"),
     modelOption("gpt-5.6-luna", "gpt-5.6-luna (Low)", "low"),
     modelOption("gpt-5.6-terra", "gpt-5.6-terra (Medium)", "medium"),
-    modelOption("gpt-5.6-sol", "gpt-5.6-sol (High)", "high"),
+    modelOption("gpt-5.6-sol", "gpt-5.6-sol (Medium)", "medium"),
   ],
 };
 
