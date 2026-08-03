@@ -39,7 +39,7 @@ runtime/*
 study_data/
 
 # Study package contents belong in local study storage, not this generic agent.
-publication/
+/publication/
 
 # Private validation and generated benchmark material.
 

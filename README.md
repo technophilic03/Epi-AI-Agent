@@ -26,7 +26,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
-python study_installer.py --study report-india-synthetic-0.2.0
+python study_installer.py --study report-india-synthetic-0.2.0.tar.gz
 python run_fastapi.py
 ```
 
