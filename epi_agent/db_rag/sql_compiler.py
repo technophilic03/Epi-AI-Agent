@@ -21,10 +21,37 @@ def _literal(value: Any) -> str:
 
 
 def _output_fields(plan: DatasetPlan) -> list[PlanField]:
-    fields = list(plan.required_fields)
-    for concept in plan.concepts:
-        fields.extend(concept.fields)
-    return [field for field in fields if field.roles & {"requested", "identifier", "grain"}]
+    fields = [
+        *plan.required_fields,
+        *(field for concept in plan.concepts for field in concept.fields),
+    ]
+    seen: set[tuple[str, str, str]] = set()
+    output: list[PlanField] = []
+    for field in fields:
+        key = (field.source, field.table, field.column)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(field)
+    return output
+
+
+def _usable_reductions(plan: DatasetPlan) -> list[PlanReduction]:
+    valid_strategies = {
+        "latest",
+        "earliest",
+        "single_matching_record",
+        "aggregate",
+    }
+    return [
+        reduction
+        for reduction in plan.reductions
+        if (
+            reduction.table
+            and reduction.group_by
+            and reduction.strategy in valid_strategies
+        )
+    ]
 
 
 def _table_aliases(plan: DatasetPlan) -> dict[str, str]:
@@ -91,8 +118,9 @@ def compile_dataset_plan_sql(plan: DatasetPlan) -> str:
     aliases = _table_aliases(plan)
     if not aliases:
         raise ValueError("Approved dataset plan has no output or linkage tables.")
-    reduced = {reduction.table: f"reduced_{index}" for index, reduction in enumerate(plan.reductions)}
-    ctes = [_reduction_cte(reduction, reduced[reduction.table]) for reduction in plan.reductions]
+    reductions = _usable_reductions(plan)
+    reduced = {reduction.table: f"reduced_{index}" for index, reduction in enumerate(reductions)}
+    ctes = [_reduction_cte(reduction, reduced[reduction.table]) for reduction in reductions]
     root_table = next(iter(aliases))
     root_relation = _quote(reduced[root_table]) if root_table in reduced else _quote(root_table)
     from_sql = f"FROM {root_relation} AS {aliases[root_table]}"

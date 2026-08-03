@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from epi_agent.protocol import ArtifactRef
 from graph.conversation_events import store_thread_artifact
@@ -50,9 +50,9 @@ class PlanField(BaseModel):
             "provenance-preserving alias whenever source columns share a name."
         ),
     )
-    purpose: str
+    purpose: str = ""
     roles: set[FieldRole] = Field(
-        min_length=1,
+        default_factory=set,
         description=(
             "Explicit semantic roles assigned by the EpiAgent from the query "
             "and schema evidence. A field can be requested, identifier, grain, "
@@ -103,26 +103,20 @@ class PlanAggregate(BaseModel):
 
 
 class PlanReduction(BaseModel):
-    """A reviewed, source-local reduction of repeated records."""
+    """An optional SQL-generation hint for repeated records.
 
-    source: str = Field(min_length=1)
-    table: str = Field(min_length=1)
-    group_by: list[PlanFieldReference] = Field(min_length=1)
-    strategy: Literal["latest", "earliest", "single_matching_record", "aggregate"]
+    Reduction hints remain typed for compatibility with the deterministic
+    compiler, but their cross-field completeness is not a dataset-plan gate.
+    """
+
+    source: str = ""
+    table: str = ""
+    group_by: list[PlanFieldReference] = Field(default_factory=list)
+    strategy: str | None = None
     order_by: PlanFieldReference | None = None
     tie_breakers: list[PlanFieldReference] = Field(default_factory=list)
     aggregates: list[PlanAggregate] = Field(default_factory=list)
     filters: list[dict[str, Any]] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_strategy_contract(self) -> "PlanReduction":
-        if self.strategy in {"latest", "earliest"} and self.order_by is None:
-            raise ValueError("order_by is required for latest and earliest reductions")
-        if self.strategy == "aggregate" and not self.aggregates:
-            raise ValueError("aggregates are required for aggregate reductions")
-        if self.strategy != "aggregate" and self.aggregates:
-            raise ValueError("aggregates are allowed only for aggregate reductions")
-        return self
 
 
 class PlanRelationshipKeyPair(BaseModel):
@@ -163,7 +157,7 @@ class PlanOperation(BaseModel):
 
 class DatasetPlan(BaseModel):
     goal: str
-    row_definition: str
+    row_definition: str = ""
     concepts: list[DatasetPlanConcept] = Field(
         description=(
             "Requested analysis variables grouped by scientific concept; "
@@ -194,7 +188,7 @@ class DatasetPlan(BaseModel):
         ),
     )
     reductions: list[PlanReduction] = Field(default_factory=list)
-    unresolved: list[dict[str, str]] = []
+    unresolved: list[dict[str, str]] = Field(default_factory=list)
 
 class StateArtifactStore:
     """Versioned artifact adapter backed by the parent state's artifact envelope."""
