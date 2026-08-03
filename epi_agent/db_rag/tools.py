@@ -1553,14 +1553,24 @@ def _plan_relationship_metrics(
             continue
         try:
             metrics.append(_relationship_metric_for_operation(context, operation))
-        except ToolExecutionError as error:
+        except (
+            ToolExecutionError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            diagnostic = (
+                error.code
+                if isinstance(error, ToolExecutionError)
+                else f"{type(error).__name__}: {error}"
+            )
             warnings.append(
                 {
                     "code": "RELATIONSHIP_METRICS_UNAVAILABLE",
                     "severity": "medium",
                     "message": (
                         "Optional relationship metadata was unavailable after "
-                        f"SQL succeeded: {error}"
+                        f"SQL succeeded: {diagnostic}"
                     ),
                 }
             )

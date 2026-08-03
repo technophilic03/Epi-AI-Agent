@@ -150,9 +150,9 @@ def _projection_bindings(
         physical = str(table.name or "").strip()
         alias = str(table.alias_or_name or "").strip()
         if physical:
-            table_names[physical] = physical
+            table_names[physical.casefold()] = physical
         if alias and physical:
-            table_names[alias] = physical
+            table_names[alias.casefold()] = physical
 
     approved = [dict(column) for column in selected_columns]
     bindings: list[dict[str, Any]] = []
@@ -161,14 +161,16 @@ def _projection_bindings(
         for source_column in projection.find_all(exp.Column):
             source_name = str(source_column.name or "").strip()
             raw_table = str(source_column.table or "").strip()
-            source_table = table_names.get(raw_table, raw_table)
+            source_table = table_names.get(raw_table.casefold(), raw_table)
             matches = [
                 column
                 for column in approved
-                if str(column.get("column") or "").strip() == source_name
+                if str(column.get("column") or "").strip().casefold()
+                == source_name.casefold()
                 and (
                     not source_table
-                    or str(column.get("table") or "").strip() == source_table
+                    or str(column.get("table") or "").strip().casefold()
+                    == source_table.casefold()
                 )
             ]
             if len(matches) == 1:
