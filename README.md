@@ -32,11 +32,11 @@ is verified, the app prints the following local address:
 
 ## Included demo data
 
-The DB-RAG demo uses a synthetic RePORT India DuckDB database, its schema
+The study uses a synthetic RePORT India database, its schema
 catalog, a matching OpenAI embedding index, verified publication summaries, and
 study-design metadata. No raw source data or original papers are included.
 
-The `data/` folder also includes small synthetic CSV fixtures and a matching
+The `data/` folder also includes small synthetic CSV files and a matching
 column dictionary for attachment and analysis demonstrations.
 
 ## Safety note
