@@ -255,6 +255,7 @@ export default function DbRagReview({
       <div className="db-rag-review-actions">
         {activeMode === "step" && conceptIndex > 0 ? (
           <button
+            className="review-action-secondary"
             disabled={disabled}
             onClick={() => setConceptIndex((current) => current - 1)}
             type="button"
@@ -262,18 +263,9 @@ export default function DbRagReview({
             Previous concept
           </button>
         ) : null}
-        <button
-          disabled={disabled}
-          onClick={() => onDecision({ action: "cancel" })}
-          type="button"
-        >
-          Cancel review
-        </button>
-        <button disabled={disabled} onClick={revise} type="button">
-          Request revision
-        </button>
         {activeMode === "all" || isFinalConcept ? (
           <button
+            className="review-action-primary"
             disabled={disabled}
             onClick={() =>
               onDecision({
@@ -287,6 +279,7 @@ export default function DbRagReview({
           </button>
         ) : (
           <button
+            className="review-action-primary"
             disabled={
               disabled ||
               (selectableKeys(currentGroup).length > 0 &&
@@ -304,6 +297,22 @@ export default function DbRagReview({
             Approve &amp; continue
           </button>
         )}
+        <button
+          className="review-action-primary"
+          disabled={disabled}
+          onClick={revise}
+          type="button"
+        >
+          Request revision
+        </button>
+        <button
+          className="review-action-secondary"
+          disabled={disabled}
+          onClick={() => onDecision({ action: "cancel" })}
+          type="button"
+        >
+          Cancel review
+        </button>
       </div>
     </section>
   );

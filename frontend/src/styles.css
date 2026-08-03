@@ -585,9 +585,9 @@ select {
 }
 
 .review-action-secondary {
-  border: 1px solid #d8dee4;
+  border: 1px solid #0969da;
   background: #ffffff;
-  color: #57606a;
+  color: #0969da;
 }
 
 .review-action-primary:disabled,
@@ -2519,20 +2519,6 @@ select {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 20px;
-}
-
-.db-rag-review-actions button {
-  border: 1px solid #0969da;
-  border-radius: 6px;
-  background: #0969da;
-  color: #ffffff;
-  padding: 8px 14px;
-  cursor: pointer;
-}
-
-.db-rag-review-actions button:first-child {
-  background: #ffffff;
-  color: #0969da;
 }
 
 .message-form button:disabled,

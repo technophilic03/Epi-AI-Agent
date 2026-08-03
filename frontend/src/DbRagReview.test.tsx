@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import DbRagReview from "./DbRagReview";
 import type { ActiveInterrupt } from "./types";
@@ -92,6 +92,21 @@ describe("DbRagReview", () => {
     expect(screen.getByText("Use baseline records.")).toBeInTheDocument();
     expect(screen.getByText("Baseline · SUBJECT_ID")).toBeInTheDocument();
     expect(screen.queryByText(/report_duckdb/)).not.toBeInTheDocument();
+    const reviewActions = document.querySelector<HTMLDivElement>(
+      ".db-rag-review-actions",
+    );
+    if (!reviewActions) {
+      throw new Error("Review action group was not rendered.");
+    }
+    expect(
+      within(reviewActions)
+        .getAllByRole("button")
+        .map((button) => button.textContent?.trim()),
+    ).toEqual([
+      "Approve plan and extract",
+      "Request revision",
+      "Cancel review",
+    ]);
 
     fireEvent.click(screen.getByRole("button", { name: "Approve plan and extract" }));
     expect(onDecision).toHaveBeenCalledWith({

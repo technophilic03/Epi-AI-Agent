@@ -241,10 +241,16 @@ export default function DbRagDatasetReview({
         >
           Approve
         </button>
-        <button disabled={disabled} onClick={revise} type="button">
-          Submit feedback
+        <button
+          className="review-action-primary"
+          disabled={disabled}
+          onClick={revise}
+          type="button"
+        >
+          Request revision
         </button>
         <button
+          className="review-action-secondary"
           disabled={disabled}
           onClick={() => onResume({ action: "cancel" })}
           type="button"

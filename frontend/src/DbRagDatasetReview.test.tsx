@@ -194,18 +194,25 @@ describe("DbRagDatasetReview", () => {
     );
     await screen.findByText("42");
 
-    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    const approveButton = screen.getByRole("button", { name: "Approve" });
+    const reviseButton = screen.getByRole("button", { name: "Request revision" });
+    const cancelButton = screen.getByRole("button", { name: "Cancel" });
+    expect(approveButton).toHaveClass("review-action-primary");
+    expect(reviseButton).toHaveClass("review-action-primary");
+    expect(cancelButton).toHaveClass("review-action-secondary");
+
+    fireEvent.click(approveButton);
     expect(onResume).toHaveBeenLastCalledWith({ action: "approve" });
     fireEvent.change(
       screen.getByLabelText("Feedback for the next dataset attempt"),
       { target: { value: "  Keep baseline rows only.  " } },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Submit feedback" }));
+    fireEvent.click(reviseButton);
     expect(onResume).toHaveBeenLastCalledWith({
       action: "revise",
       feedback: "Keep baseline rows only.",
     });
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(cancelButton);
     expect(onResume).toHaveBeenLastCalledWith({ action: "cancel" });
   });
 });
