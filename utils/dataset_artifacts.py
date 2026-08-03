@@ -63,6 +63,8 @@ _DATASET_PROVENANCE_KEYS = {
     "grain_columns",
     "join_expansion",
     "name",
+    "output_column_sources",
+    "post_sql_warnings",
     "plan_id",
     "plan_version",
     "population_assumption",

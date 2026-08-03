@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 from uuid import uuid4
 
@@ -127,132 +126,168 @@ def _sql_candidate_review_texts(
     return source_question, goal_text
 
 
-def _projection_aliases_to_selected_columns(
+def _projection_bindings(
     sql: str,
     selected_columns: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    sql_text = str(sql or "").strip()
-    if not sql_text:
-        return {}
-    selected_by_pair = {
-        (
-            str(column.get("table") or "").strip(),
-            str(column.get("column") or "").strip(),
-        ): dict(column)
-        for column in selected_columns
-        if str(column.get("column") or "").strip()
-    }
-    selected_by_column: dict[str, list[dict[str, Any]]] = {}
-    for column in selected_columns:
-        column_name = str(column.get("column") or "").strip()
-        if column_name:
-            selected_by_column.setdefault(column_name, []).append(
-                dict(column)
-            )
-
-    def match(source_table: str, source_name: str) -> dict[str, Any] | None:
-        matched = (
-            selected_by_pair.get((source_table, source_name))
-            if source_table
-            else None
-        )
-        if matched is None:
-            candidates = selected_by_column.get(source_name) or []
-            if len(candidates) == 1:
-                matched = candidates[0]
-        return dict(matched) if matched is not None else None
-
+) -> list[dict[str, Any]]:
     try:
         import sqlglot
         from sqlglot import exp
 
-        expression = sqlglot.parse_one(sql_text, dialect="duckdb")
+        expression = sqlglot.parse_one(sql, dialect="duckdb")
     except Exception:
-        aliases: dict[str, dict[str, Any]] = {}
-        for table_token, column_token, alias_token in re.findall(
-            r'(?is)(?:"?([A-Za-z_][A-Za-z0-9_]*)"?\.)?"?([A-Za-z_][A-Za-z0-9_]*)"?\s+AS\s+"?([A-Za-z_][A-Za-z0-9_]*)"?',
-            sql_text,
-        ):
-            matched = match(
-                str(table_token or "").strip(),
-                str(column_token or "").strip(),
-            )
-            output_name = str(alias_token or "").strip()
-            if matched is not None and output_name:
-                aliases[output_name] = matched
-        return aliases
-
-    select = expression.find(exp.Select)
+        return []
+    select = (
+        expression
+        if isinstance(expression, exp.Select)
+        else expression.find(exp.Select)
+    )
     if select is None:
-        return {}
-    aliases: dict[str, dict[str, Any]] = {}
-    for projection in list(select.expressions or []):
-        output_name = str(
-            getattr(projection, "alias_or_name", "") or ""
-        ).strip()
-        source_column = next(iter(projection.find_all(exp.Column)), None)
-        if not output_name or source_column is None:
-            continue
-        matched = match(
-            str(getattr(source_column, "table", "") or "").strip(),
-            str(getattr(source_column, "name", "") or "").strip(),
+        return []
+
+    table_names: dict[str, str] = {}
+    for table in expression.find_all(exp.Table):
+        physical = str(table.name or "").strip()
+        alias = str(table.alias_or_name or "").strip()
+        if physical:
+            table_names[physical] = physical
+        if alias and physical:
+            table_names[alias] = physical
+
+    approved = [dict(column) for column in selected_columns]
+    bindings: list[dict[str, Any]] = []
+    for position, projection in enumerate(select.expressions or []):
+        source_fields: list[dict[str, str]] = []
+        for source_column in projection.find_all(exp.Column):
+            source_name = str(source_column.name or "").strip()
+            raw_table = str(source_column.table or "").strip()
+            source_table = table_names.get(raw_table, raw_table)
+            matches = [
+                column
+                for column in approved
+                if str(column.get("column") or "").strip() == source_name
+                and (
+                    not source_table
+                    or str(column.get("table") or "").strip() == source_table
+                )
+            ]
+            if len(matches) == 1:
+                matched = matches[0]
+                source_fields.append(
+                    {
+                        key: str(matched.get(key) or "").strip()
+                        for key in ("source", "table", "column")
+                        if str(matched.get(key) or "").strip()
+                    }
+                )
+        bindings.append(
+            {
+                "position": position,
+                "sql_alias": str(projection.alias_or_name or "").strip(),
+                "source_fields": source_fields,
+            }
         )
-        if matched is not None:
-            aliases[output_name] = matched
-    return aliases
+    return bindings
 
 
-def _selected_columns_by_output_position(
-    dataframe: Any,
-    selected_columns: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    output_columns = [
-        str(name or "").strip()
-        for name in list(getattr(dataframe, "columns", []))
-    ]
-    approved_columns = [
-        dict(column)
-        for column in selected_columns
-        if str(column.get("column") or "").strip()
-    ]
-    if not output_columns or len(output_columns) != len(approved_columns):
-        return {}
-    return {
-        output_columns[index]: approved_columns[index]
-        for index in range(len(output_columns))
-        if output_columns[index]
-    }
-
-
-def _build_subset_schema(
+def _reconcile_output_columns(
     dataframe: Any,
     selected_columns: list[dict[str, Any]],
     *,
     sql: str,
-) -> dict[str, dict[str, Any]]:
-    selected_by_name = {
-        str(column.get("column") or "").strip(): column
-        for column in selected_columns
-        if str(column.get("column") or "").strip()
+) -> dict[str, Any]:
+    physical = [str(column) for column in dataframe.columns]
+    bindings = _projection_bindings(sql, selected_columns)
+    sources: dict[str, dict[str, Any]] = {}
+    warnings: list[dict[str, str]] = []
+    for position, physical_name in enumerate(physical):
+        binding = (
+            dict(bindings[position])
+            if position < len(bindings)
+            else {
+                "position": position,
+                "sql_alias": physical_name,
+                "source_fields": [],
+            }
+        )
+        sql_alias = str(binding.get("sql_alias") or "").strip()
+        source_fields = [
+            dict(field)
+            for field in list(binding.get("source_fields") or [])
+            if isinstance(field, dict)
+        ]
+        sources[physical_name] = {
+            "position": position,
+            "sql_alias": sql_alias or physical_name,
+            "source_fields": source_fields,
+        }
+        if sql_alias and sql_alias != physical_name:
+            warnings.append(
+                {
+                    "code": "OUTPUT_ALIAS_DISAMBIGUATED",
+                    "severity": "medium",
+                    "message": (
+                        f"SQL alias {sql_alias!r} was stored as physical output "
+                        f"column {physical_name!r} at position {position}."
+                    ),
+                }
+            )
+        if not source_fields:
+            warnings.append(
+                {
+                    "code": "OUTPUT_METADATA_UNRESOLVED",
+                    "severity": "medium",
+                    "message": (
+                        f"Source metadata could not be resolved for physical output "
+                        f"column {physical_name!r} at position {position}."
+                    ),
+                }
+            )
+    return {
+        "schema": _build_schema_from_sources(
+            dataframe,
+            selected_columns,
+            sources,
+        ),
+        "output_column_sources": sources,
+        "warnings": warnings,
     }
-    selected_by_alias = _projection_aliases_to_selected_columns(
-        sql,
-        selected_columns,
-    )
-    selected_by_position = _selected_columns_by_output_position(
-        dataframe,
-        selected_columns,
-    )
+
+
+def _build_schema_from_sources(
+    dataframe: Any,
+    selected_columns: list[dict[str, Any]],
+    sources: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    selected_by_pair = {
+        (
+            str(column.get("source") or "").strip(),
+            str(column.get("table") or "").strip(),
+            str(column.get("column") or "").strip(),
+        ): dict(column)
+        for column in selected_columns
+    }
     schema: dict[str, dict[str, Any]] = {}
     dtypes = getattr(dataframe, "dtypes", None)
-    for column_name in list(getattr(dataframe, "columns", [])):
+    for position, column_name in enumerate(
+        list(getattr(dataframe, "columns", []))
+    ):
         column_key = str(column_name)
-        selected = (
-            selected_by_name.get(column_key)
-            or selected_by_alias.get(column_key)
-            or selected_by_position.get(column_key)
-            or {}
-        )
+        binding = dict(sources.get(column_key) or {})
+        source_fields = list(binding.get("source_fields") or [])
+        selected: dict[str, Any] = {}
+        if source_fields:
+            source_field = dict(source_fields[0])
+            selected = selected_by_pair.get(
+                (
+                    str(source_field.get("source") or "").strip(),
+                    str(source_field.get("table") or "").strip(),
+                    str(source_field.get("column") or "").strip(),
+                ),
+                {},
+            )
+        if not selected and position < len(selected_columns):
+            selected = dict(selected_columns[position])
         table_name = str(selected.get("table") or "").strip()
         reviewed_meta = _lookup_schema_variable_metadata(
             table_name,
@@ -365,6 +400,12 @@ def persist_sql_subset_artifact(
             or ""
         ).strip()
     )
+    dataframe = _read_value(execution_result, "dataframe")
+    reconciliation = _reconcile_output_columns(
+        dataframe,
+        selected_columns,
+        sql=persisted_sql,
+    )
     provenance: dict[str, Any] = {
         "source": "db_rag_sql",
         "thread_id": thread_id,
@@ -396,6 +437,10 @@ def persist_sql_subset_artifact(
         "feedback_history": list(
             _read_value(approved_selection, "feedback_history", []) or []
         ),
+        "output_column_sources": dict(
+            reconciliation["output_column_sources"]
+        ),
+        "post_sql_warnings": list(reconciliation["warnings"]),
     }
     if plan_id and plan_version is not None:
         provenance.update(
@@ -450,12 +495,8 @@ def persist_sql_subset_artifact(
         "dataset_id": str(dataset_id or "").strip()
         or f"subset-{uuid4().hex[:8]}",
         "kind": "subset",
-        "dataframe": _read_value(execution_result, "dataframe"),
-        "schema": _build_subset_schema(
-            _read_value(execution_result, "dataframe"),
-            selected_columns,
-            sql=persisted_sql,
-        ),
+        "dataframe": dataframe,
+        "schema": reconciliation["schema"],
         "provenance": provenance,
         "artifact_version": artifact_version,
         "artifact_status": artifact_status,
