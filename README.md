@@ -2,7 +2,7 @@
 
 This is a lightweight local demo of AI Agent focusing on Epidemiological Research. It runs on macOS and Linux
 with Python 3.12 and an OpenAI API key.
-[Watch the demo video](https://drive.google.com/file/d/1n8z-QALdizVbGePQ5w4A8jyIJbkOzGJm/view?usp=sharing)
+[Watch the demo video](https://drive.google.com/file/d/1A-N8pTOn6tKcZ_D6DLPc62EWvb2e_68E/view?usp=sharing)
 ## Start the demo
 
 ```bash
