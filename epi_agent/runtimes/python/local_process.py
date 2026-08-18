@@ -28,6 +28,9 @@ MAX_FIGURE_BYTES = 10_000_000
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _ALLOWED_ENVIRONMENT = ("PATH", "LANG", "LC_ALL", "PYTHONUTF8")
+_NPROC_HEADROOM = 128
+_NPROC_FLOOR = 256
+_NPROC_FALLBACK = 4096
 
 
 def _failure(
@@ -71,6 +74,36 @@ def _read_bounded(path: Path, maximum: int, *, code: str) -> bytes:
     return path.read_bytes()
 
 
+def _nproc_limit() -> int:
+    """RLIMIT_NPROC counts the invoking user's tasks machine-wide, so a fixed
+    cap breaks on busy hosts. Budget headroom above the current task count to
+    keep fork bombs bounded without starving BLAS/thread-pool startup."""
+    try:
+        uid = os.getuid()
+        total = 0
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/status", "rb") as handle:
+                    matched_uid = False
+                    threads = 0
+                    for raw in handle:
+                        if raw.startswith(b"Uid:"):
+                            matched_uid = int(raw.split()[1]) == uid
+                        elif raw.startswith(b"Threads:"):
+                            threads = int(raw.split()[1])
+                if matched_uid:
+                    total += threads
+            except (OSError, ValueError, IndexError):
+                continue
+        if total <= 0:
+            return _NPROC_FALLBACK
+        return max(_NPROC_FLOOR, total + _NPROC_HEADROOM)
+    except OSError:
+        return _NPROC_FALLBACK
+
+
 def _resource_limit_specs(
     *,
     timeout_seconds: float,
@@ -78,10 +111,11 @@ def _resource_limit_specs(
     platform_name: str,
 ) -> tuple[tuple[str, int, int], ...]:
     cpu_seconds = max(1, int(math.ceil(timeout_seconds)))
+    nproc = _nproc_limit()
     limits = [
         ("RLIMIT_CPU", cpu_seconds, cpu_seconds + 1),
         ("RLIMIT_FSIZE", MAX_FIGURE_BYTES + MAX_RESULT_BYTES, -1),
-        ("RLIMIT_NPROC", 64, 64),
+        ("RLIMIT_NPROC", nproc, nproc),
     ]
     if memory_limit_bytes is not None and platform_name != "darwin":
         limits.append(
@@ -311,6 +345,15 @@ class LocalPythonRuntime:
                     "PYTHONUTF8": "1",
                     "MPLBACKEND": "Agg",
                     "MPLCONFIGDIR": str(run_dir / "matplotlib"),
+                    # BLAS/OpenMP thread pools must fit inside RLIMIT_NPROC
+                    # (which counts the user's processes machine-wide); one
+                    # thread keeps numpy/scipy imports from failing with
+                    # "pthread_create failed: Resource temporarily unavailable".
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "NUMEXPR_NUM_THREADS": "1",
+                    "VECLIB_MAXIMUM_THREADS": "1",
                 }
             )
             command = [
