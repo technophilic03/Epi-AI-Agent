@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 
-from api.conversation_history import ConversationHistoryStore, OpenAIConversationTitleGenerator
+from api.conversation_history import ConversationHistoryStore, ConversationTitleGenerator
 from api.deployment import checkpoint_db_path, runtime_root, static_dir, study_root
 from api.runtime import ReportAgentApiRuntime
 from api.schemas import RuntimeCapabilities, RuntimeCapability
 from api.server import create_app
 from db_rag.config import (
+    embedding_credentials_ready,
     resolve_db_rag_embedding_model,
     resolve_db_rag_reranker_model,
 )
@@ -15,16 +16,16 @@ from db_rag.readiness import DbRagReadiness, resolve_db_rag_readiness
 from epi_agent.studies import StudyRegistry
 from utils.env_loader import load_app_environment
 from graph.builder import build_graph
-from llm_vllm import build_openai_llm
+from llm_vllm import build_chat_llm
 from study_package.registry import discover_studies
 from utils.model_runtime_profiles import model_runtime_profile
 from utils.runtime_defaults import (
     DEFAULT_MAX_AUTO_STEPS,
-    DEFAULT_OPENAI_MODEL,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+    configured_default_model,
     configured_epi_agent_max_iterations,
-    configured_openai_models,
+    configured_models,
     configured_title_model,
 )
 
@@ -52,6 +53,14 @@ def _db_rag_readiness(
         return DbRagReadiness(
             status="not_configured",
             message=_unselected_study_message(studies),
+        )
+    if not embedding_credentials_ready():
+        return DbRagReadiness(
+            status="not_configured",
+            message=(
+                "DB-RAG semantic search requires OPENAI_API_KEY for query "
+                "embeddings; add the key to enable database extraction."
+            ),
         )
     return resolve_db_rag_readiness(
         paths=paths,
@@ -81,11 +90,10 @@ def _capability(
 
 load_app_environment()
 
-model_name = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-allowed_models = configured_openai_models(os.environ)
+model_name = configured_default_model(os.environ)
+allowed_models = configured_models(os.environ)
 title_model = configured_title_model(os.environ)
 max_iterations = configured_epi_agent_max_iterations(os.environ)
-api_key = os.getenv("OPENAI_API_KEY", "")
 runtime_root_path = runtime_root()
 db_path = checkpoint_db_path(runtime_root_path)
 studies = discover_studies(study_root() / "studies")
@@ -101,10 +109,7 @@ db_rag_readiness = _db_rag_readiness(
 
 def graph_factory(settings):
     profile = model_runtime_profile(settings.model_name)
-    llm = build_openai_llm(
-        model_name=settings.model_name,
-        api_key=api_key,
-    )
+    llm = build_chat_llm(model_name=settings.model_name)
     return build_graph(
         llm,
         model_profile=profile,
@@ -116,6 +121,15 @@ def graph_factory(settings):
         db_rag_embedding_model=db_rag_embedding_model,
         max_iterations=max_iterations,
     )
+
+
+def _build_title_generator(model_id: str) -> ConversationTitleGenerator | None:
+    try:
+        return ConversationTitleGenerator(build_chat_llm(model_name=model_id))
+    except ValueError:
+        # A missing title-model credential must not block startup;
+        # conversations keep their default title instead.
+        return None
 
 
 default_runtime_settings = {
@@ -136,9 +150,7 @@ runtime = ReportAgentApiRuntime(
     models=list(allowed_models),
     runtime_root=runtime_root_path,
     history_store=ConversationHistoryStore(db_path),
-    title_generator=OpenAIConversationTitleGenerator(
-        build_openai_llm(model_name=title_model, api_key=api_key)
-    ),
+    title_generator=_build_title_generator(title_model),
     capabilities=RuntimeCapabilities(
         publication_knowledge=_capability(
             default_study,

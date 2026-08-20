@@ -6,6 +6,7 @@ from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from db_rag.config import embedding_credentials_ready
 from db_rag.readiness import DbRagReadiness, resolve_db_rag_readiness
 from epi_agent.agent import build_general_epi_agent_graph
 from epi_agent.runtimes.python import LocalPythonRuntime
@@ -22,12 +23,14 @@ from utils.model_runtime_profiles import ModelRuntimeProfile
 def _build_attachment_reader_service(
     llm: Any,
     runtime_root: str | Path,
+    *,
+    supports_vision: bool = True,
 ) -> AttachmentReaderService:
     root = Path(runtime_root).expanduser().resolve()
     return AttachmentReaderService(
         LocalAttachmentStore(root),
         runtime_root=root,
-        vision_analyzer=LangChainVisionAnalyzer(llm),
+        vision_analyzer=LangChainVisionAnalyzer(llm) if supports_vision else None,
     )
 
 
@@ -46,13 +49,25 @@ def build_graph(
     """Compile the single checkpointed EpiAgent used by FastAPI."""
 
     root = Path(runtime_root).expanduser().resolve()
-    attachment_reader_service = _build_attachment_reader_service(llm, root)
+    attachment_reader_service = _build_attachment_reader_service(
+        llm,
+        root,
+        supports_vision=model_profile.supports_vision,
+    )
     selected_study = studies.get(default_study_id) if default_study_id else None
     paths = getattr(selected_study, "db_rag_paths", None)
     readiness = db_rag_readiness or (
         resolve_db_rag_readiness(
             paths=paths,
             expected_embedding_model=db_rag_embedding_model,
+        )
+        if paths is not None and embedding_credentials_ready()
+        else DbRagReadiness(
+            status="not_configured",
+            message=(
+                "DB-RAG semantic search requires OPENAI_API_KEY for query "
+                "embeddings; add the key to enable database extraction."
+            ),
         )
         if paths is not None
         else DbRagReadiness(

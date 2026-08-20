@@ -191,6 +191,8 @@ function modelOption(
   return {
     id,
     label,
+    provider: "openai",
+    provider_label: "OpenAI",
     reasoning_tier: "standard",
     summary: "Reliable general-purpose default.",
     initial_output_tokens: 8_192,
@@ -284,9 +286,9 @@ describe("App", () => {
               state: "error",
               steps: 1,
               error: "RateLimitError: quota exhausted",
-              error_code: "openai_insufficient_quota",
+              error_code: "PROVIDER_CREDITS_EXHAUSTED",
               user_message:
-                "OpenAI could not run this request because the configured account has no available API quota or billing. Update billing or use a funded API key, then try again.",
+                "The provider account has no remaining API credits. Add credits or use a funded API key, then retry.",
               started_at: null,
               updated_at: null,
             },
@@ -306,7 +308,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "configured account has no available API quota or billing",
+      "no remaining API credits",
     );
     expect(composer).not.toBeDisabled();
     fireEvent.change(composer, { target: { value: "Try again" } });

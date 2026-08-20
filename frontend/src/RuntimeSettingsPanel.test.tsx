@@ -22,6 +22,8 @@ function modelOption(
   return {
     id,
     label,
+    provider: "openai",
+    provider_label: "OpenAI",
     reasoning_tier,
     summary: `${label} guidance.`,
     initial_output_tokens: 8_192,

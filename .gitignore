@@ -45,3 +45,7 @@ study_data/
 
 db_rag/benchmark/
 
+
+# Deployment-specific model endpoints (example stays committed).
+config/custom_models.json
+CLAUDE.md

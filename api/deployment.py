@@ -8,8 +8,15 @@ from pathlib import Path
 DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r"^http://(127\.0\.0\.1|localhost):\d+$"
 
 
-def required_secret_names() -> tuple[str, ...]:
-    return ("OPENAI_API_KEY",)
+def required_secret_names(profiles=None) -> tuple[str, ...]:
+    """Env var names that must be non-empty for the configured models."""
+    if profiles is None:
+        return ("OPENAI_API_KEY",)
+    names: dict[str, None] = {}
+    for profile in profiles:
+        if profile.api_key_required and profile.api_key_env:
+            names.setdefault(profile.api_key_env)
+    return tuple(names)
 
 
 def native_static_dir(project_root: str | Path) -> Path:

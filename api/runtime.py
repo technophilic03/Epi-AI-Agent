@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import logging
 import threading
 import time
 import uuid
@@ -14,15 +15,6 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
-import httpx
-from openai import (
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    AuthenticationError,
-    PermissionDeniedError,
-    RateLimitError,
-)
 import pandas as pd
 from pydantic import TypeAdapter, ValidationError
 
@@ -50,7 +42,7 @@ from api.schemas import (
     RuntimeSettings,
     TablePreview,
 )
-from api.conversation_history import ConversationHistoryStore, OpenAIConversationTitleGenerator
+from api.conversation_history import ConversationHistoryStore, ConversationTitleGenerator
 from epi_agent.analysis_artifacts import AnalysisRun
 from graph.conversation_events import (
     append_conversation_event,
@@ -79,7 +71,10 @@ from utils.review_interrupts import (
     validate_resume_decision,
 )
 from utils.model_runtime_profiles import model_runtime_profile
+from utils.provider_errors import classify_llm_error
 
+
+_LOGGER = logging.getLogger(__name__)
 
 _ACTIVE_INTERRUPT_ADAPTER = TypeAdapter(ActiveInterrupt)
 _PUBLIC_INTERRUPT_TYPES = {
@@ -111,82 +106,8 @@ def _idle_status() -> dict[str, Any]:
     }
 
 
-def _public_failure(code: str, message: str) -> tuple[str, str]:
-    return code, f"{message} Error: {code}"
-
-
-def _provider_error_markers(value: Any) -> set[str]:
-    markers: set[str] = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in {"code", "type"} and item is not None:
-                markers.add(str(item).strip().lower())
-            markers.update(_provider_error_markers(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            markers.update(_provider_error_markers(item))
-    return markers
-
-
 def _run_failure(exc: Exception) -> tuple[str, str]:
-    if isinstance(exc, (APITimeoutError, httpx.TimeoutException)):
-        return _public_failure(
-            "MODEL_REQUEST_TIMEOUT",
-            "The selected model did not respond within its request timeout.",
-        )
-    if isinstance(exc, APIConnectionError):
-        return _public_failure(
-            "OPENAI_CONNECTION_FAILED",
-            "The server could not reach OpenAI. Check the network connection, "
-            "then retry.",
-        )
-    if isinstance(exc, AuthenticationError) or (
-        isinstance(exc, APIStatusError) and exc.status_code == 401
-    ):
-        return _public_failure(
-            "OPENAI_AUTHENTICATION_FAILED",
-            "OpenAI rejected the configured API key. Update OPENAI_API_KEY and "
-            "restart the server.",
-        )
-    if isinstance(exc, PermissionDeniedError) or (
-        isinstance(exc, APIStatusError) and exc.status_code == 403
-    ):
-        return _public_failure(
-            "OPENAI_ACCESS_DENIED",
-            "The configured OpenAI project is not allowed to use this resource. "
-            "Check the project's permissions or use another API key.",
-        )
-    body = exc.body if isinstance(exc, APIStatusError) else {}
-    markers = _provider_error_markers(body)
-    if isinstance(exc, RateLimitError):
-        if markers & {"insufficient_quota", "credit_balance_exhausted"}:
-            return _public_failure(
-                "OPENAI_CREDITS_EXHAUSTED",
-                "The OpenAI account has no remaining API credits. Add credits or "
-                "use a funded API key, then retry.",
-            )
-        return _public_failure(
-            "OPENAI_RATE_LIMITED",
-            "OpenAI's request limit was reached. Wait briefly, then retry.",
-        )
-    if "context_length_exceeded" in markers:
-        return _public_failure(
-            "OPENAI_CONTEXT_LIMIT_EXCEEDED",
-            "This conversation exceeds the selected model's context limit. Start a "
-            "new conversation or reduce the attached content.",
-        )
-    if "model_not_found" in markers or (
-        isinstance(exc, APIStatusError) and exc.status_code == 404
-    ):
-        return _public_failure(
-            "OPENAI_MODEL_UNAVAILABLE",
-            "The selected OpenAI model is unavailable to this API project. Choose "
-            "another model and retry.",
-        )
-    return _public_failure(
-        "RUN_FAILED",
-        "The request failed unexpectedly. Check the server log for details.",
-    )
+    return classify_llm_error(exc)
 
 
 def _json_safe(value: Any) -> Any:
@@ -546,6 +467,7 @@ class ApiGraphRunner:
                 update_step()
         except Exception as exc:
             error_code, user_message = _run_failure(exc)
+            _LOGGER.exception("Graph run failed (%s)", error_code)
             return finish(
                 "error",
                 f"{type(exc).__name__}: {exc}",
@@ -617,7 +539,7 @@ class ReportAgentApiRuntime:
         )
     )
     history_store: ConversationHistoryStore | None = None
-    title_generator: OpenAIConversationTitleGenerator | None = None
+    title_generator: ConversationTitleGenerator | None = None
     _threads: dict[str, ThreadRuntime] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _attachment_store: LocalAttachmentStore | None = field(
@@ -1558,7 +1480,7 @@ class ReportAgentApiRuntime:
         values = dict(getattr(snapshot, "values", None) or {})
         return build_thread_export(
             thread_id,
-            "openai",
+            model_runtime_profile(thread.settings.model_name).provider,
             thread.settings.model_name,
             values,
             attachment_store=self._attachment_store,

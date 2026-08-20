@@ -173,7 +173,7 @@ class ConversationHistoryStore:
         return self.get(thread_id)
 
 
-class OpenAIConversationTitleGenerator:
+class ConversationTitleGenerator:
     def __init__(self, model: object) -> None:
         self._model = model
 
@@ -191,3 +191,7 @@ class OpenAIConversationTitleGenerator:
             ]
         )
         return ConversationHistoryStore._title(coerce_text_content(response.content))
+
+
+# Deprecated alias kept for older imports.
+OpenAIConversationTitleGenerator = ConversationTitleGenerator
