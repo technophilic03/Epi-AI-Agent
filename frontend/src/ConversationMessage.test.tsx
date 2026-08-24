@@ -165,28 +165,125 @@ describe("ConversationMessage", () => {
       .toBeInTheDocument();
   });
 
-  it("renders escaped inline math-like text as readable prose", () => {
-    render(
+  it("typesets the standard normal PDF and CDF in inline and display math", async () => {
+    const { container } = render(
       <ConversationMessage
         fetchAttachmentBlob={fetchAttachmentBlob}
         message={{
-          id: "assistant-1",
+          id: "assistant-normal",
           role: "assistant",
           text: [
-            "Results:",
-            "- Never married: OR $\\approx 1.08 \\times 10^{-21}$, 95% CI $[0, \\infty]$, $p=1.000$",
-            "- Cross-tab confirmed that only raw category mapped to $1$.",
+            "For \\(Z \\sim \\mathcal{N}(0,1)\\):",
+            "",
+            "\\[ f_Z(z)=\\frac{1}{\\sqrt{2\\pi}}\\exp\\left(-\\frac{z^2}{2}\\right) \\]",
+            "",
+            "\\[ \\Phi(z)=\\int_{-\\infty}^{z} \\frac{1}{\\sqrt{2\\pi}} \\exp\\left(-\\frac{u^2}{2}\\right)\\,du \\]",
           ].join("\n"),
         }}
       />,
     );
 
-    expect(screen.getByText(/OR ≈ 1.08 × 10\^{-21}/)).toBeInTheDocument();
-    expect(screen.getByText(/95% CI \[0, ∞\]/)).toBeInTheDocument();
-    expect(screen.getByText(/p=1.000/)).toBeInTheDocument();
-    expect(screen.getByText(/mapped to 1\./)).toBeInTheDocument();
-    expect(screen.queryByText(/\\approx/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/\$p=1\.000\$/)).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(container.querySelectorAll(".katex").length).toBeGreaterThanOrEqual(3);
+    });
+    expect(container.querySelectorAll(".katex-display")).toHaveLength(2);
+    expect(container.querySelector(".message-body")).toHaveTextContent("For");
+  });
+
+  it("supports all configured math delimiters and leaves literal dollars readable", async () => {
+    const { container } = render(
+      <ConversationMessage
+        fetchAttachmentBlob={fetchAttachmentBlob}
+        message={{
+          id: "assistant-delimiters",
+          role: "assistant",
+          text: [
+            "Inline \\(x^2\\) and $y^2$.",
+            "",
+            "\\[x+y\\]",
+            "",
+            "$$x-y$$",
+            "",
+            "The visit costs $15.",
+          ].join("\n"),
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll(".katex")).toHaveLength(4);
+    });
+    expect(container.querySelectorAll(".katex-display")).toHaveLength(2);
+    expect(container).toHaveTextContent("$15");
+  });
+
+  it("leaves an escaped dollar sign as ordinary text", async () => {
+    const { container } = render(
+      <ConversationMessage
+        fetchAttachmentBlob={fetchAttachmentBlob}
+        message={{
+          id: "assistant-escaped-dollar",
+          role: "assistant",
+          text: "The visit costs \\$15.",
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(container).toHaveTextContent("$15"));
+    expect(container.querySelector(".katex")).toBeNull();
+  });
+
+  it("does not crash on malformed math or typeset fenced code", async () => {
+    const { container } = render(
+      <ConversationMessage
+        fetchAttachmentBlob={fetchAttachmentBlob}
+        message={{
+          id: "assistant-protected-math",
+          role: "assistant",
+          text: [
+            "Before \\(\\frac{1}{\\) after.",
+            "",
+            "```text",
+            "\\[not rendered\\]",
+            "```",
+          ].join("\n"),
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(container).toHaveTextContent("after"));
+    expect(container).toHaveTextContent("frac");
+    const code = container.querySelector(".code-block code");
+    expect(code).toHaveTextContent("\\[not rendered\\]");
+    expect(code?.querySelector(".katex")).toBeNull();
+  });
+
+  it("typesets DB-RAG details while preserving SQL as code", async () => {
+    const { container } = render(
+      <ConversationMessage
+        fetchAttachmentBlob={fetchAttachmentBlob}
+        message={{
+          id: "assistant-db-rag-math",
+          role: "assistant",
+          text: [
+            "Dataset `subset-1` was created with 2 rows.",
+            "Estimated effect: \\(HR=1.5\\).",
+            "SQL used:",
+            "```sql",
+            "SELECT '\\\\(not_math\\\\)' AS expression",
+            "```",
+          ].join("\n"),
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".db-rag-result-summary .katex"))
+        .toBeInTheDocument();
+    });
+    const sql = container.querySelector(".code-block code");
+    expect(sql).toHaveTextContent("not_math");
+    expect(sql?.querySelector(".katex")).toBeNull();
   });
 
   it("renders hover message actions with a timestamp and copy control but no edit action", async () => {

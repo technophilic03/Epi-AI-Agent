@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import renderMathInElement from "katex/contrib/auto-render";
+import "katex/dist/katex.min.css";
 import ClarificationTrace from "./ClarificationTrace";
 import CodeBlock from "./CodeBlock";
 import MessageAttachment from "./MessageAttachment";
@@ -183,15 +185,6 @@ function parseMarkdownBlocks(text: string): MarkdownBlock[] {
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {
-  function normalizeTextSegment(segment: string) {
-    return segment
-      .replace(/\$([^$\n]+)\$/g, "$1")
-      .replace(/\\approx/g, "≈")
-      .replace(/\\times/g, "×")
-      .replace(/\\infty/g, "∞")
-      .replace(/\\\$/g, "$");
-  }
-
   return text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((segment, index) => {
     if (segment.startsWith("`") && segment.endsWith("`") && segment.length > 1) {
       return (
@@ -205,9 +198,9 @@ function renderInlineMarkdown(text: string): ReactNode[] {
       segment.endsWith("**") &&
       segment.length > 4
     ) {
-      return <strong key={index}>{normalizeTextSegment(segment.slice(2, -2))}</strong>;
+      return <strong key={index}>{segment.slice(2, -2)}</strong>;
     }
-    return normalizeTextSegment(segment);
+    return segment;
   });
 }
 
@@ -336,6 +329,34 @@ export default function ConversationMessage({
 }: Props) {
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [messageCopied, setMessageCopied] = useState(false);
+  const messageBodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const messageBody = messageBodyRef.current;
+    if (!messageBody) {
+      return;
+    }
+    renderMathInElement(messageBody, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "\\[", right: "\\]", display: true },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "$", right: "$", display: false },
+      ],
+      ignoredTags: [
+        "script",
+        "noscript",
+        "style",
+        "textarea",
+        "pre",
+        "code",
+        "option",
+      ],
+      throwOnError: false,
+      trust: false,
+    });
+  }, [message.text]);
+
   const parts =
     message.role === "assistant"
       ? parseAssistantMessage(message.text)
@@ -401,7 +422,7 @@ export default function ConversationMessage({
             Cancelled
           </span>
         ) : null}
-        <div className="message-body">
+        <div className="message-body" ref={messageBodyRef}>
           {parts.map((part, index) => {
             if (part.type === "code") {
               return (
