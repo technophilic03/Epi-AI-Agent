@@ -3,8 +3,39 @@ export type RunState =
   | "running"
   | "interrupted"
   | "done"
+  | "cancelled"
   | "error"
   | "timeout";
+
+export type ActivityItemStatus = "running" | "completed" | "waiting";
+
+export type ActivityRunState =
+  | "running"
+  | "waiting"
+  | "completed"
+  | "cancelled"
+  | "error";
+
+export interface ActivityItem {
+  id: string;
+  sequence: number;
+  label: string;
+  status: ActivityItemStatus;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ActivityRun {
+  id: string;
+  thread_id: string;
+  user_message_id: string;
+  state: ActivityRunState;
+  activities: ActivityItem[];
+  created_at: string;
+  updated_at: string;
+}
 
 export interface RunStatus {
   state: RunState;
@@ -38,6 +69,23 @@ export interface RuntimeCapabilities {
   db_rag_dataset: RuntimeCapability;
 }
 
+export type EmbeddingRetrievalMode =
+  | "hybrid_vector_lexical"
+  | "lexical_fallback";
+
+export interface EmbeddingStartupStatus {
+  profile_id: string;
+  profile_label: string;
+  provider: string;
+  index_compatibility: string;
+  available: boolean;
+  retrieval_mode: EmbeddingRetrievalMode;
+  reason_code: string | null;
+  message: string;
+  compatible_study_ids: string[];
+  incompatible_study_ids: string[];
+}
+
 export type ModelProvider = "openai" | "anthropic" | "openai_compatible";
 
 export interface ModelOption {
@@ -45,7 +93,7 @@ export interface ModelOption {
   label: string;
   provider: ModelProvider;
   provider_label: string;
-  reasoning_tier: "standard" | "low" | "medium" | "high";
+  supports_sampling_controls: boolean;
   summary: string;
   initial_output_tokens: number;
   automatic_output_token_ceiling: number;
@@ -61,6 +109,7 @@ export interface RuntimeOptions {
   defaults: RuntimeSettings;
   models: ModelOption[];
   capabilities: RuntimeCapabilities;
+  embedding_startup_status: EmbeddingStartupStatus;
 }
 
 export interface ConversationSummary {
@@ -72,6 +121,7 @@ export interface ConversationSummary {
   updated_at: string;
   last_opened_at: string | null;
   archived_at: string | null;
+  awaiting_review: boolean;
 }
 
 export interface ConversationAttachment {
@@ -116,6 +166,7 @@ export interface ConversationMessage {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
+  status?: "cancelled" | null;
   created_at?: string | null;
   attachments?: ConversationAttachment[];
   clarifications?: ClarificationExchange[];
@@ -379,12 +430,17 @@ export interface ApiThreadState {
   thread_id: string;
   run: RunStatus;
   conversation: ConversationMessage[];
+  activity_runs: ActivityRun[];
   active_interrupt: ActiveInterrupt | null;
   runtime_settings: RuntimeSettings | null;
   runtime_settings_locked: boolean;
   model_name?: string;
+  model_label?: string;
+  model_available?: boolean;
+  model_replacement_required?: boolean;
   datasets: Array<{ id: string; label: string; row_count: number | null }>;
   file_artifacts: FileArtifactSummary[];
   output: Record<string, unknown>;
   diagnostics: Record<string, unknown>;
+  embedding_startup_status: EmbeddingStartupStatus;
 }

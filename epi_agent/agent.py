@@ -9,6 +9,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RunnableConfig
 from langchain_core.messages import HumanMessage
 
+from epi_agent.activity import ActivitySink, NULL_ACTIVITY_SINK
 from epi_agent.artifacts import StateArtifactStore
 from epi_agent.attachments.tools import build_attachment_tool_registry
 from epi_agent.db_rag.prompt import DB_RAG_SYSTEM_PROMPT
@@ -22,7 +23,7 @@ from epi_agent.runtime import (
     build_epi_agent_graph,
 )
 from epi_agent.runtimes.python import LocalPythonRuntime
-from epi_agent.studies import StudyRegistry
+from epi_agent.studies import SearchableStudyDesignProvider, StudyRegistry
 from epi_agent.tool_packs.analysis import (
     build_analysis_review_tool_registry,
 )
@@ -35,10 +36,19 @@ from epi_agent.tool_packs.publication import (
     build_publication_tool_registry,
 )
 from epi_agent.tool_packs.publication.pubmed import is_pubmed_configured
+from epi_agent.tool_packs.study_design import (
+    STUDY_DESIGN_SYSTEM_PROMPT,
+    build_study_design_tool_registry,
+)
+from epi_agent.tool_packs.studies import (
+    STUDY_ROUTING_SYSTEM_PROMPT,
+    render_installed_study_context,
+)
 from utils.attachment_readers import AttachmentReaderService
 from utils.dataset_artifacts import is_selectable_dataset_artifact
 from utils.model_runtime_profiles import ModelRuntimeProfile
 from utils.runtime_defaults import DEFAULT_EPI_AGENT_MAX_ITERATIONS
+from utils.user_storage import UserStorageLayout
 
 
 _MAX_CARD_COLUMNS = 100
@@ -53,6 +63,16 @@ interpretation. Use the registered capabilities iteratively in this same
 conversation. Do not hand results to another agent for interpretation.
 Choose the least sufficient action; database extraction is not required for
 literature, metadata, or general epidemiology questions.
+
+Clarification rules:
+- Before asking any clarification, use applicable registered evidence tools
+  when they can establish the answer.
+- Ask when human intent or knowledge is genuinely required. Never guess merely
+  to avoid clarification.
+- If investigation demonstrates a limitation that user input cannot resolve,
+  report the limitation.
+- Do not repeat a clarification the user has answered or that subsequent
+  evidence has resolved.
 
 Attachment rules:
 - Use only authorized attachment IDs. Inspect before selecting a reader.
@@ -126,15 +146,22 @@ General utility rules:
   inspection, or epidemiological analysis."""
 
 
-def build_general_system_prompt(*, include_db_rag: bool) -> str:
+def build_general_system_prompt(
+    *,
+    include_db_rag: bool,
+    include_study_design: bool = False,
+) -> str:
     sections = [
         GENERAL_CORE_INSTRUCTIONS,
+        STUDY_ROUTING_SYSTEM_PROMPT,
         build_publication_system_prompt(
             include_pubmed=is_pubmed_configured(),
         ),
     ]
     if include_db_rag:
         sections.append(DB_RAG_SYSTEM_PROMPT)
+    if include_study_design:
+        sections.append(STUDY_DESIGN_SYSTEM_PROMPT)
     return "\n\n".join(sections)
 
 
@@ -154,7 +181,7 @@ def epi_agent_completion_issues(state: dict[str, Any]) -> list[str]:
 def build_epi_agent_context_prompt(
     state: dict[str, Any],
     *,
-    study_design_context: str = "",
+    installed_study_context: str = "",
 ) -> str:
     artifacts = dict(state.get("artifacts") or {})
     authorized_attachment_ids = set(
@@ -302,10 +329,34 @@ def build_epi_agent_context_prompt(
             sort_keys=True,
         )
     )
-    design_context = " ".join(str(study_design_context or "").split())
-    if design_context:
-        return f"{artifact_context}\n\n{design_context}"
-    return artifact_context
+    contexts = [artifact_context]
+    cancelled_turn = dict(state.get("cancelled_turn") or {})
+    cancelled_text = _bounded_text(cancelled_turn.get("text"))
+    cancelled_attachment_ids = _bounded_strings(
+        cancelled_turn.get("attachment_ids")
+    )
+    if cancelled_text or cancelled_attachment_ids:
+        cancelled_context = {
+            "text": cancelled_text,
+            "attachment_ids": cancelled_attachment_ids,
+        }
+        contexts.append(
+            "Most recent cancelled user turn. This record is inactive: do not "
+            "continue it unless the latest user message explicitly asks to retry, "
+            "continue, or refer to that work. Restart tools from the latest approved "
+            "state; never claim to resume a partial tool execution. If a referenced "
+            "attachment cannot be inspected, ask the user to reattach it:\n"
+            + json.dumps(
+                cancelled_context,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    study_context = str(installed_study_context or "").strip()
+    if study_context:
+        contexts.append(study_context)
+    return "\n\n".join(contexts)
 
 
 def _unique_strings(value: object) -> list[str]:
@@ -400,18 +451,23 @@ def build_general_epi_agent_graph(
     model_profile: ModelRuntimeProfile,
     service: AttachmentReaderService,
     studies: StudyRegistry,
-    default_study_id: str | None = None,
     runtime_root: str | Path | None,
     python_runtime: Any | None = None,
     include_db_rag: bool = True,
     checkpointer: Any | None = None,
     max_iterations: int = DEFAULT_EPI_AGENT_MAX_ITERATIONS,
+    activity_sink: ActivitySink = NULL_ACTIVITY_SINK,
 ) -> CompiledStateGraph:
+    include_study_design = any(
+        isinstance(study.study_design, SearchableStudyDesignProvider)
+        for study in studies.values
+    )
     registry = build_general_epi_agent_registry(
         service=service,
         python_runtime=python_runtime,
         runtime_root=runtime_root,
         include_db_rag=include_db_rag,
+        studies=studies,
     )
 
     def context_factory(
@@ -420,16 +476,26 @@ def build_general_epi_agent_graph(
         artifact_store: StateArtifactStore,
     ) -> ToolContext:
         configurable = dict(config.get("configurable") or {})
-        active_study_id = str(
-            state.get("active_study_id") or default_study_id or ""
+        owner_user_id = str(
+            configurable.get("owner_user_id") or "local-user"
+        ).strip()
+        conversation_thread_id = str(
+            configurable.get("conversation_thread_id")
+            or configurable.get("thread_id")
+            or ""
         ).strip()
         return ToolContext(
-            study=studies.get(active_study_id),
+            studies=studies,
             artifact_store=artifact_store,
-            thread_id=str(configurable.get("thread_id") or ""),
+            thread_id=conversation_thread_id,
             policy=None,
-            available_study_ids=tuple(
-                study.study_id for study in studies.values
+            thread_storage=(
+                UserStorageLayout(runtime_root).thread(
+                    owner_user_id,
+                    conversation_thread_id,
+                )
+                if runtime_root is not None and owner_user_id and conversation_thread_id
+                else None
             ),
             attachment_store=service.store,
             authorized_attachment_ids=tuple(
@@ -448,20 +514,12 @@ def build_general_epi_agent_graph(
         )
 
     def context_prompt_factory(state: dict[str, Any]) -> str:
-        active_study_id = str(
-            state.get("active_study_id") or default_study_id or ""
-        ).strip()
-        study = studies.get(active_study_id)
-        study_design = getattr(study, "study_design", None)
-        render_context = getattr(study_design, "render_context", None)
-        study_design_context = (
-            str(render_context()).strip()
-            if callable(render_context)
-            else ""
-        )
         return build_epi_agent_context_prompt(
             state,
-            study_design_context=study_design_context,
+            installed_study_context=render_installed_study_context(
+                studies,
+                max_chars=model_profile.routing_context_char_ceiling,
+            ),
         )
 
     return build_epi_agent_graph(
@@ -471,10 +529,12 @@ def build_general_epi_agent_graph(
             agent_name="epi_agent",
             system_prompt=build_general_system_prompt(
                 include_db_rag=include_db_rag,
+                include_study_design=include_study_design,
             ),
             registry=registry,
             studies=studies,
             context_factory=context_factory,
+            activity_sink=activity_sink,
             completion_issues=epi_agent_completion_issues,
             context_prompt_factory=context_prompt_factory,
             model_profile=model_profile,
@@ -490,6 +550,7 @@ def build_general_epi_agent_registry(
     python_runtime: Any | None = None,
     runtime_root: str | Path | None,
     include_db_rag: bool = True,
+    studies: StudyRegistry | None = None,
 ) -> ToolRegistry:
     resolved_python_runtime = python_runtime or LocalPythonRuntime(
         runtime_root=runtime_root,
@@ -499,6 +560,18 @@ def build_general_epi_agent_registry(
             *build_general_tool_registry().tools(),
             *build_attachment_tool_registry(service).tools(),
             *build_publication_tool_registry().tools(),
+            *(
+                build_study_design_tool_registry().tools()
+                if studies is not None
+                and any(
+                    isinstance(
+                        study.study_design,
+                        SearchableStudyDesignProvider,
+                    )
+                    for study in studies.values
+                )
+                else ()
+            ),
             *(
                 build_db_rag_tool_registry().tools()
                 if include_db_rag

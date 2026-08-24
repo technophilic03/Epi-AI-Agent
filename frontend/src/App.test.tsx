@@ -10,13 +10,33 @@ import {
 } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import App, { isPendingMessageAcknowledged } from "./App";
+import {
+  AppForTesting as App,
+  isPendingMessageAcknowledged,
+  normalizeNewConversationRuntimeSettings,
+} from "./App";
+import { createApiClient } from "./apiClient";
 import type {
+  ActivityRun,
   ApiThreadState,
   ModelOption,
   RuntimeOptions,
   RuntimeSettings,
+  EmbeddingStartupStatus,
 } from "./types";
+
+const hybridEmbeddingStatus: EmbeddingStartupStatus = {
+  profile_id: "openai-text-embedding-3-large",
+  profile_label: "OpenAI text-embedding-3-large",
+  provider: "openai",
+  index_compatibility: "OpenAI/text-embedding-3-large",
+  available: true,
+  retrieval_mode: "hybrid_vector_lexical",
+  reason_code: null,
+  message: "",
+  compatible_study_ids: [],
+  incompatible_study_ids: [],
+};
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -41,6 +61,7 @@ function threadState(
       updated_at: null,
     },
     conversation: [],
+    activity_runs: [],
     active_interrupt: null,
     runtime_settings: null,
     runtime_settings_locked: false,
@@ -48,6 +69,34 @@ function threadState(
     file_artifacts: [],
     output: {},
     diagnostics: {},
+    embedding_startup_status: hybridEmbeddingStatus,
+    ...overrides,
+  };
+}
+
+function activityRun(
+  state: ActivityRun["state"] = "running",
+  overrides: Partial<ActivityRun> = {},
+): ActivityRun {
+  return {
+    id: "activity-run-1",
+    thread_id: "thread-1",
+    user_message_id: "user-1",
+    state,
+    activities: [
+      {
+        id: "activity-1",
+        sequence: 1,
+        label: "Searching the data catalog",
+        status: state === "waiting" ? "waiting" : "running",
+        tool_name: "dbrag-search_catalog",
+        tool_call_id: "call-1",
+        created_at: "2026-08-11T00:00:00+00:00",
+        updated_at: "2026-08-11T00:00:00+00:00",
+      },
+    ],
+    created_at: "2026-08-11T00:00:00+00:00",
+    updated_at: "2026-08-11T00:00:00+00:00",
     ...overrides,
   };
 }
@@ -193,7 +242,7 @@ function modelOption(
     label,
     provider: "openai",
     provider_label: "OpenAI",
-    reasoning_tier: "standard",
+    supports_sampling_controls: true,
     summary: "Reliable general-purpose default.",
     initial_output_tokens: 8_192,
     automatic_output_token_ceiling: 16_384,
@@ -223,7 +272,7 @@ const runtimeOptions: RuntimeOptions = {
     modelOption("gpt-5.4", "gpt-5.4 (Standard)"),
     modelOption("gpt-5.4-mini", "gpt-5.4-mini"),
     modelOption("gpt-5.6-sol", "gpt-5.6-sol (Medium)", {
-      reasoning_tier: "medium",
+      supports_sampling_controls: false,
       summary: "Deepest and highest-cost tier for complex analysis.",
       initial_output_tokens: 25_000,
       automatic_output_token_ceiling: 50_000,
@@ -235,6 +284,7 @@ const runtimeOptions: RuntimeOptions = {
       incremental_output_cost: "$0.75",
     }),
   ],
+  embedding_startup_status: hybridEmbeddingStatus,
 };
 
 function createThreadResponse(threadId = "thread-1") {
@@ -258,7 +308,99 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("normalizeNewConversationRuntimeSettings", () => {
+  it("normalizes runtime settings against provider-neutral model options", () => {
+    const validSettings: RuntimeSettings = {
+      ...defaultRuntimeSettings,
+      model_name: "custom/qwen3",
+      temperature: 0.7,
+    };
+    const staleSettings: RuntimeSettings = {
+      ...defaultRuntimeSettings,
+      model_name: "removed/historical-model",
+    };
+    const options: RuntimeOptions = {
+      ...runtimeOptions,
+      defaults: {
+        ...defaultRuntimeSettings,
+        model_name: "custom/qwen3",
+      },
+      models: [
+        modelOption("custom/qwen3", "Qwen 3 via custom endpoint", {
+          provider: "openai_compatible",
+          provider_label: "Custom endpoint",
+        }),
+      ],
+    };
+
+    expect(
+      normalizeNewConversationRuntimeSettings(validSettings, options),
+    ).toBe(validSettings);
+    expect(
+      normalizeNewConversationRuntimeSettings(staleSettings, options),
+    ).toBe(options.defaults);
+  });
+});
+
 describe("App", () => {
+  it("shows one startup fallback notice before and after thread creation", async () => {
+    const message =
+      "Semantic embedding search is unavailable. " +
+      "(OpenAI text-embedding-3-large is not configured.) Catalog, publication, " +
+      "and study-design searches will use lexical matching only.";
+    const fallbackStatus: EmbeddingStartupStatus = {
+      ...hybridEmbeddingStatus,
+      available: false,
+      retrieval_mode: "lexical_fallback",
+      reason_code: "EMBEDDING_CREDENTIALS_MISSING",
+      message,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        runtimeOptionsResponse({
+          ...runtimeOptions,
+          embedding_startup_status: fallbackStatus,
+        }),
+      )
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            conversation: [{ id: "user-1", role: "user", text: "Hello" }],
+            embedding_startup_status: fallbackStatus,
+          }),
+        ),
+      );
+    render(
+      <App
+        apiBase="http://api.test"
+        fetchImpl={fetchMock}
+        loadConversationHistory={false}
+      />,
+    );
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    fireEvent.change(
+      screen.getByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Hello" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getAllByText(message)).toHaveLength(1);
+  });
+
+  it("renders the local application without hosted account controls", async () => {
+    render(<App apiBase="http://api.test" loadConversationHistory={false} />);
+
+    expect(
+      await screen.findByText("Ask questions about your data or query from existing database"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Signed-in user")).not.toBeInTheDocument();
+  });
+
   it("shows the updated initial prompt and example question without a ready status", async () => {
     render(<App apiBase="http://api.test" loadConversationHistory={false} />);
 
@@ -458,18 +600,19 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/attachments",
     );
     expect(uploadInit.body.getAll("files")).toEqual([file]);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      4,
-      "http://api.test/api/threads/thread-1/messages",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: "Analyze this cohort",
-          attachment_ids: ["attachment-csv"],
-        }),
-      },
-    );
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://api.test/api/threads/thread-1/messages",
+        {
+          method: "POST",
+          headers: expect.any(Headers),
+          body: JSON.stringify({
+            text: "Analyze this cohort",
+            attachment_ids: ["attachment-csv"],
+          }),
+        },
+      );
+    });
   });
 
   it("renders a submitted user message without the initial suggestion before the backend responds", async () => {
@@ -533,6 +676,264 @@ describe("App", () => {
       "needs_code",
     );
     expect(messageList.children[1]).toHaveTextContent("Agent is working");
+  });
+
+  it("places a running timeline directly after its matching user message", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "running",
+              steps: 1,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Create a cohort" },
+            ],
+            activity_runs: [activityRun()],
+          }),
+        ),
+      );
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    fireEvent.change(
+      await screen.findByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Create a cohort" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const messageList = await screen.findByRole("list", {
+      name: "Conversation messages",
+    });
+    const timeline = await within(messageList).findByLabelText(
+      "Agent activity timeline",
+    );
+    expect(messageList.children[0]).toHaveTextContent("Create a cohort");
+    expect(messageList.children[1]).toBe(timeline);
+    expect(within(messageList).queryByLabelText("Agent activity")).not.toBeInTheDocument();
+  });
+
+  it("updates a polled activity in place without duplicating it", async () => {
+    vi.useFakeTimers();
+    const updatedRun = activityRun("running", {
+      activities: [
+        {
+          ...activityRun().activities[0],
+          status: "completed",
+          updated_at: "2026-08-11T00:00:01+00:00",
+        },
+        {
+          id: "activity-2",
+          sequence: 2,
+          label: "Choosing the next step",
+          status: "running",
+          tool_name: null,
+          tool_call_id: null,
+          created_at: "2026-08-11T00:00:01+00:00",
+          updated_at: "2026-08-11T00:00:01+00:00",
+        },
+      ],
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "running",
+              steps: 1,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Create a cohort" },
+            ],
+            activity_runs: [activityRun()],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "running",
+              steps: 2,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Create a cohort" },
+            ],
+            activity_runs: [updatedRun],
+          }),
+        ),
+      );
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Create a cohort" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getAllByText("Searching the data catalog")).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    expect(screen.getAllByText("Searching the data catalog")).toHaveLength(1);
+    expect(screen.getByText("Choosing the next step")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Agent activity timeline")).toHaveLength(1);
+  });
+
+  it("renders repeated successful calls as separate plain-language rows", async () => {
+    const first = {
+      ...activityRun().activities[0],
+      status: "completed" as const,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "running",
+              steps: 2,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Create a cohort" },
+            ],
+            activity_runs: [
+              activityRun("running", {
+                activities: [
+                  first,
+                  {
+                    ...first,
+                    id: "activity-2",
+                    sequence: 2,
+                    tool_call_id: "call-2",
+                  },
+                ],
+              }),
+            ],
+          }),
+        ),
+      );
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    fireEvent.change(
+      await screen.findByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Create a cohort" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findAllByText("Searching the data catalog")).toHaveLength(2);
+    expect(screen.queryByText("dbrag-search_catalog")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Call 1|Call 2/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a waiting timeline last in the message list before its review card", async () => {
+    const waiting = activityRun("waiting", {
+      user_message_id: "message-1",
+      activities: [
+        {
+          ...activityRun().activities[0],
+          label: "Waiting for dataset plan review",
+          status: "waiting",
+          tool_name: "dbrag-request_dataset_plan_review",
+        },
+      ],
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse({ ...reviewState(), activity_runs: [waiting] }),
+      );
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    fireEvent.change(
+      await screen.findByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Find projects about diabetes" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const messageList = await screen.findByRole("list", {
+      name: "Conversation messages",
+    });
+    const timeline = await within(messageList).findByLabelText(
+      "Agent activity timeline",
+    );
+    const approve = screen.getByRole("button", { name: "Approve plan and extract" });
+    expect(messageList.lastElementChild).toBe(timeline);
+    expect(messageList.contains(approve)).toBe(false);
+    expect(
+      messageList.compareDocumentPosition(approve) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("shows a completed historical timeline collapsed", async () => {
+    const completed = activityRun("completed", {
+      activities: [
+        {
+          ...activityRun().activities[0],
+          status: "completed",
+        },
+      ],
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "done",
+              steps: 2,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Create a cohort" },
+            ],
+            activity_runs: [completed],
+          }),
+        ),
+      );
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    fireEvent.change(
+      await screen.findByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Create a cohort" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(
+      await screen.findByRole("button", { name: "Show activity history · 1 step" }),
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it.each(["awaiting_clarification", "retrying_after_error", "needs_code"])(
@@ -629,10 +1030,11 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://api.test/api/runtime/options",
+      { headers: expect.any(Headers) },
     );
     expect(fetchMock).toHaveBeenNthCalledWith(2, "http://api.test/api/threads", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: expect.any(Headers),
       body: JSON.stringify({ model_name: "gpt-5.4-mini" }),
     });
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -640,7 +1042,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ text: "Find NIH grants" }),
       },
     );
@@ -689,7 +1091,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ text: "Find NIH grants" }),
       },
     );
@@ -727,6 +1129,7 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://api.test/api/runtime/options",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -895,10 +1298,14 @@ describe("App", () => {
       ),
     ).toHaveClass("composer-model-lock-popover");
 
+    expect(
+      screen.queryByRole("button", {
+        name: "Start new conversation from saved conversations",
+      }),
+    ).not.toBeInTheDocument();
     const newConversation = screen.getByRole("button", {
-      name: "Start new conversation from saved conversations",
+      name: "New conversation",
     });
-    expect(newConversation).toHaveClass("conversation-history-new-button");
     fireEvent.click(newConversation);
 
     expect(
@@ -907,6 +1314,464 @@ describe("App", () => {
     expect(
       screen.getByRole("button", { name: "TB cohort survival analysis" }),
     ).toBeInTheDocument();
+  });
+
+  it("ignores a late state response from a previously selected conversation", async () => {
+    const stateA = deferred<Response>();
+    const stateB = deferred<Response>();
+    const summaries = [
+      {
+        thread_id: "thread-a",
+        title: "Thread A",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+      {
+        thread_id: "thread-b",
+        title: "Thread B",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({ items: summaries }));
+      }
+      if (url === "http://api.test/api/threads/thread-a/state") {
+        return stateA.promise;
+      }
+      if (url === "http://api.test/api/threads/thread-b/state") {
+        return stateB.promise;
+      }
+      if (url === "http://api.test/api/conversations/thread-a/open") {
+        return Promise.resolve(jsonResponse(summaries[0]));
+      }
+      if (url === "http://api.test/api/conversations/thread-b/open") {
+        return Promise.resolve(jsonResponse(summaries[1]));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Thread A" }));
+    fireEvent.click(screen.getByRole("button", { name: "Thread B" }));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading selected conversation",
+    );
+
+    await act(async () => {
+      stateB.resolve(jsonResponse(threadState({
+        thread_id: "thread-b",
+        conversation: [{ id: "b-user", role: "user", text: "Message B" }],
+      })));
+    });
+    expect(await screen.findByText("Message B")).toBeInTheDocument();
+
+    await act(async () => {
+      stateA.resolve(jsonResponse(threadState({
+        thread_id: "thread-a",
+        conversation: [{ id: "a-user", role: "user", text: "Who are you" }],
+      })));
+    });
+
+    expect(screen.queryByText("Who are you")).not.toBeInTheDocument();
+    expect(screen.getByText("Message B")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Thread B" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
+  it("ignores a message response after the user switches conversations", async () => {
+    const submitA = deferred<Response>();
+    const summaries = [
+      {
+        thread_id: "thread-a",
+        title: "Submit Thread A",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+      {
+        thread_id: "thread-b",
+        title: "Submit Thread B",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({ items: summaries }));
+      }
+      if (url === "http://api.test/api/threads/thread-a/state") {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-a",
+          conversation: [{ id: "a-original", role: "user", text: "Original A" }],
+        })));
+      }
+      if (url === "http://api.test/api/threads/thread-b/state") {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-b",
+          conversation: [{ id: "b-original", role: "user", text: "Original B" }],
+        })));
+      }
+      if (
+        url === "http://api.test/api/threads/thread-a/messages" &&
+        init?.method === "POST"
+      ) {
+        return submitA.promise;
+      }
+      if (url.endsWith("/open")) {
+        return Promise.resolve(jsonResponse(
+          url.includes("thread-a") ? summaries[0] : summaries[1],
+        ));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Submit Thread A" }));
+    expect(await screen.findByText("Original A")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Continue A" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    fireEvent.click(screen.getByRole("button", { name: "Submit Thread B" }));
+    expect(await screen.findByText("Original B")).toBeInTheDocument();
+
+    await act(async () => {
+      submitA.resolve(jsonResponse(threadState({
+        thread_id: "thread-a",
+        conversation: [{ id: "a-late", role: "user", text: "Late A" }],
+      })));
+    });
+
+    expect(screen.queryByText("Late A")).not.toBeInTheDocument();
+    expect(screen.getByText("Original B")).toBeInTheDocument();
+  });
+
+  it("keeps a resumed review response attached to its owning conversation", async () => {
+    const resumeA = deferred<Response>();
+    const summaries = [
+      {
+        thread_id: "thread-a",
+        title: "Review Thread A",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: true,
+      },
+      {
+        thread_id: "thread-b",
+        title: "Review Thread B",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({ items: summaries }));
+      }
+      if (url === "http://api.test/api/threads/thread-a/state") {
+        return Promise.resolve(jsonResponse({ ...reviewState(), thread_id: "thread-a" }));
+      }
+      if (url === "http://api.test/api/threads/thread-b/state") {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-b",
+          conversation: [{ id: "b-review", role: "user", text: "Safe Thread B" }],
+        })));
+      }
+      if (
+        url === "http://api.test/api/threads/thread-a/interrupts/interrupt-1/resume" &&
+        init?.method === "POST"
+      ) {
+        return resumeA.promise;
+      }
+      if (url.endsWith("/open")) {
+        return Promise.resolve(jsonResponse(
+          url.includes("thread-a") ? summaries[0] : summaries[1],
+        ));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Review Thread A" }));
+    expect(
+      await screen.findByText(
+        "This conversation was previously paused and is awaiting your review.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel review" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review Thread B" }));
+    expect(await screen.findByText("Safe Thread B")).toBeInTheDocument();
+
+    await act(async () => {
+      resumeA.resolve(jsonResponse(threadState({
+        thread_id: "thread-a",
+        conversation: [{ id: "a-resumed", role: "user", text: "Resumed A" }],
+      })));
+    });
+
+    expect(screen.queryByText("Resumed A")).not.toBeInTheDocument();
+    expect(screen.getByText("Safe Thread B")).toBeInTheDocument();
+  });
+
+  it("clears the saved-conversation review badge after resume and cancellation", async () => {
+    let conversationRequests = 0;
+    let threadStateRequests = 0;
+    const summary = {
+      thread_id: "thread-1",
+      title: "Clarification thread",
+      title_source: "automatic" as const,
+      model_name: "gpt-5.6-terra",
+      created_at: "2026-08-23T00:00:00+00:00",
+      updated_at: "2026-08-23T00:00:00+00:00",
+      last_opened_at: null,
+      archived_at: null,
+      awaiting_review: true,
+    };
+    const clarificationState = threadState({
+      run: {
+        state: "interrupted",
+        steps: 2,
+        error: null,
+        error_code: null,
+        user_message: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        { id: "user-1", role: "user", text: "Create a cohort" },
+      ],
+      active_interrupt: {
+        id: "interrupt-clarification",
+        type: "agent_clarification",
+        question: "Which follow-up window should be used?",
+        reason: "The outcome exists at multiple visits.",
+        options: [
+          { id: "month-12", label: "Use the 12-month visit." },
+        ],
+      },
+    });
+    const runningState = threadState({
+      run: {
+        state: "running",
+        steps: 3,
+        error: null,
+        error_code: null,
+        user_message: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        { id: "user-1", role: "user", text: "Create a cohort" },
+      ],
+    });
+    const cancelledState = threadState({
+      run: {
+        state: "cancelled",
+        steps: 3,
+        error: null,
+        error_code: null,
+        user_message: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        {
+          id: "user-1",
+          role: "user",
+          text: "Create a cohort",
+          status: "cancelled",
+        },
+      ],
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        conversationRequests += 1;
+        return Promise.resolve(
+          jsonResponse({
+            items: [
+              {
+                ...summary,
+                awaiting_review: conversationRequests < 3,
+              },
+            ],
+          }),
+        );
+      }
+      if (url === "http://api.test/api/threads/thread-1/state") {
+        threadStateRequests += 1;
+        return Promise.resolve(
+          jsonResponse(threadStateRequests === 1 ? clarificationState : runningState),
+        );
+      }
+      if (url === "http://api.test/api/conversations/thread-1/open") {
+        return Promise.resolve(jsonResponse(summary));
+      }
+      if (
+        url ===
+          "http://api.test/api/threads/thread-1/interrupts/interrupt-clarification/resume" &&
+        init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse(runningState));
+      }
+      if (
+        url === "http://api.test/api/threads/thread-1/cancel" &&
+        init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse(cancelledState));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+
+    expect(await screen.findByText("Awaiting review")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clarification thread" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Let the agent decide" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Awaiting review")).not.toBeInTheDocument();
+    });
+    expect(conversationRequests).toBe(3);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Awaiting review")).not.toBeInTheDocument();
+      expect(
+        screen.getByLabelText("Ask a question about your dataset!"),
+      ).toBeEnabled();
+    });
+    expect(conversationRequests).toBe(4);
+  });
+
+  it("ignores a cancellation response after switching conversations", async () => {
+    const cancelA = deferred<Response>();
+    const summaries = [
+      {
+        thread_id: "thread-a",
+        title: "Running Thread A",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+      {
+        thread_id: "thread-b",
+        title: "Idle Thread B",
+        title_source: "automatic",
+        model_name: "gpt-5.6-terra",
+        created_at: "2026-08-19T00:00:00+00:00",
+        updated_at: "2026-08-19T00:00:00+00:00",
+        last_opened_at: null,
+        archived_at: null,
+        awaiting_review: false,
+      },
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({ items: summaries }));
+      }
+      if (url === "http://api.test/api/threads/thread-a/state") {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-a",
+          run: { state: "running", steps: 1, error: null },
+          conversation: [{ id: "a-running", role: "user", text: "Running A" }],
+        })));
+      }
+      if (url === "http://api.test/api/threads/thread-b/state") {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-b",
+          conversation: [{ id: "b-idle", role: "user", text: "Idle B" }],
+        })));
+      }
+      if (
+        url === "http://api.test/api/threads/thread-a/cancel" &&
+        init?.method === "POST"
+      ) {
+        return cancelA.promise;
+      }
+      if (url.endsWith("/open")) {
+        return Promise.resolve(jsonResponse(
+          url.includes("thread-a") ? summaries[0] : summaries[1],
+        ));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Running Thread A" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
+    fireEvent.click(screen.getByRole("button", { name: "Idle Thread B" }));
+    expect(await screen.findByText("Idle B")).toBeInTheDocument();
+
+    await act(async () => {
+      cancelA.resolve(jsonResponse(threadState({
+        thread_id: "thread-a",
+        conversation: [{ id: "a-cancelled", role: "user", text: "Cancelled A" }],
+      })));
+    });
+
+    expect(screen.queryByText("Cancelled A")).not.toBeInTheDocument();
+    expect(screen.getByText("Idle B")).toBeInTheDocument();
   });
 
   it("deletes an open saved conversation and returns to a blank conversation", async () => {
@@ -1024,6 +1889,226 @@ describe("App", () => {
     expect(resumedMessageBody).toBe(JSON.stringify({ text: "Continue the analysis" }));
   });
 
+  it("confirms an available replacement before continuing saved history", async () => {
+    const savedThreadId = "thread-saved";
+    const confirm = vi.spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    let submittedBody: BodyInit | null | undefined;
+    const claudeOptions: RuntimeOptions = {
+      ...runtimeOptions,
+      defaults: {
+        ...defaultRuntimeSettings,
+        model_name: "claude-opus-5",
+      },
+      models: [
+        modelOption("claude-opus-5", "Claude Opus 5", {
+          provider: "anthropic",
+          provider_label: "Anthropic",
+          supports_sampling_controls: false,
+        }),
+      ],
+    };
+    const historicalState = threadState({
+      thread_id: savedThreadId,
+      conversation: [
+        { id: "prior-user", role: "user", text: "Compare TB survival" },
+      ],
+      runtime_settings: {
+        ...defaultRuntimeSettings,
+        model_name: "gpt-5.6-terra",
+      },
+      runtime_settings_locked: true,
+      model_name: "gpt-5.6-terra",
+      model_label: "gpt-5.6-terra (Medium)",
+      model_available: false,
+      model_replacement_required: true,
+    } as unknown as Partial<ApiThreadState>);
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse(claudeOptions));
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({
+          items: [{
+            thread_id: savedThreadId,
+            title: "TB cohort survival analysis",
+            title_source: "automatic",
+            model_name: "gpt-5.6-terra",
+            created_at: "2026-07-30T00:00:00+00:00",
+            updated_at: "2026-07-30T00:00:00+00:00",
+          }],
+        }));
+      }
+      if (url === `http://api.test/api/threads/${savedThreadId}/state`) {
+        return Promise.resolve(jsonResponse(historicalState));
+      }
+      if (url.endsWith("/open")) {
+        return Promise.resolve(jsonResponse({
+          thread_id: savedThreadId,
+          title: "TB cohort survival analysis",
+          title_source: "automatic",
+          model_name: "gpt-5.6-terra",
+          created_at: "2026-07-30T00:00:00+00:00",
+          updated_at: "2026-07-30T00:00:00+00:00",
+        }));
+      }
+      if (
+        url === `http://api.test/api/threads/${savedThreadId}/messages`
+        && init?.method === "POST"
+      ) {
+        submittedBody = init.body;
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: savedThreadId,
+          runtime_settings: claudeOptions.defaults,
+          runtime_settings_locked: true,
+        })));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", {
+      name: "TB cohort survival analysis",
+    }));
+
+    expect(await screen.findByText(/used gpt-5.6-terra \(Medium\)/i))
+      .toBeInTheDocument();
+    const replacement = screen.getByRole("combobox", {
+      name: "Replacement model",
+    });
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    fireEvent.change(replacement, { target: { value: "claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Continue the analysis" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(submittedBody).toBeUndefined();
+    expect(screen.getByLabelText("Ask a question about your dataset!"))
+      .toHaveValue("Continue the analysis");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(submittedBody).toBe(JSON.stringify({
+        text: "Continue the analysis",
+        model_name: "claude-opus-5",
+      }));
+    });
+    expect(confirm).toHaveBeenLastCalledWith(
+      "This conversation used gpt-5.6-terra (Medium). Continue with Claude Opus 5?",
+    );
+  });
+
+  it("normalizes an unavailable historical model before creating a new conversation", async () => {
+    const savedThreadId = "thread-saved";
+    let createThreadBody: BodyInit | null | undefined;
+    const claudeOptions: RuntimeOptions = {
+      ...runtimeOptions,
+      defaults: {
+        ...defaultRuntimeSettings,
+        model_name: "claude-opus-5",
+      },
+      models: [
+        modelOption("claude-opus-5", "Claude Opus 5", {
+          provider: "anthropic",
+          provider_label: "Anthropic",
+          supports_sampling_controls: false,
+        }),
+      ],
+    };
+    const historicalState = threadState({
+      thread_id: savedThreadId,
+      conversation: [
+        { id: "prior-user", role: "user", text: "Compare TB survival" },
+      ],
+      runtime_settings: {
+        ...defaultRuntimeSettings,
+        model_name: "gpt-5.6-terra",
+      },
+      runtime_settings_locked: true,
+      model_name: "gpt-5.6-terra",
+      model_label: "gpt-5.6-terra (Medium)",
+      model_available: false,
+      model_replacement_required: true,
+    } as unknown as Partial<ApiThreadState>);
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse(claudeOptions));
+      }
+      if (url === "http://api.test/api/conversations") {
+        return Promise.resolve(jsonResponse({
+          items: [{
+            thread_id: savedThreadId,
+            title: "TB cohort survival analysis",
+            title_source: "automatic",
+            model_name: "gpt-5.6-terra",
+            created_at: "2026-07-30T00:00:00+00:00",
+            updated_at: "2026-07-30T00:00:00+00:00",
+          }],
+        }));
+      }
+      if (url === `http://api.test/api/threads/${savedThreadId}/state`) {
+        return Promise.resolve(jsonResponse(historicalState));
+      }
+      if (url === `http://api.test/api/conversations/${savedThreadId}/open`) {
+        return Promise.resolve(jsonResponse({
+          thread_id: savedThreadId,
+          title: "TB cohort survival analysis",
+          title_source: "automatic",
+          model_name: "gpt-5.6-terra",
+          created_at: "2026-07-30T00:00:00+00:00",
+          updated_at: "2026-07-30T00:00:00+00:00",
+        }));
+      }
+      if (url === "http://api.test/api/threads" && init?.method === "POST") {
+        createThreadBody = init.body;
+        return Promise.resolve(createThreadResponse("thread-new"));
+      }
+      if (
+        url === "http://api.test/api/threads/thread-new/messages"
+        && init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse(threadState({
+          thread_id: "thread-new",
+          run: {
+            state: "done",
+            steps: 1,
+            error: null,
+            started_at: null,
+            updated_at: null,
+          },
+          conversation: [
+            { id: "new-user", role: "user", text: "New Claude request" },
+          ],
+        })));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    fireEvent.click(await screen.findByRole("button", {
+      name: "TB cohort survival analysis",
+    }));
+    expect(await screen.findByText("Compare TB survival")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "New Claude request" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(createThreadBody).toBeDefined());
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveValue(
+      "claude-opus-5",
+    );
+    expect(createThreadBody).toBe(JSON.stringify({
+      model_name: "claude-opus-5",
+    }));
+  });
+
   it("keeps the newest saved-conversation list when an earlier refresh finishes late", async () => {
     const initialHistory = deferred<Response>();
     const refreshedHistory = deferred<Response>();
@@ -1101,6 +2186,161 @@ describe("App", () => {
 
     expect(screen.getByRole("button", { name: "Assistant identity" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Analyze diabetes outcomes" })).toBeInTheDocument();
+  });
+
+  it("refreshes an untitled conversation until its generated title arrives", async () => {
+    vi.useFakeTimers();
+    let historyRequests = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        historyRequests += 1;
+        const title = historyRequests >= 4
+          ? "Concurrent response check"
+          : "Untitled conversation";
+        return Promise.resolve(jsonResponse({
+          items: historyRequests === 1 ? [] : [{
+            thread_id: "thread-1",
+            title,
+            title_source: "automatic",
+            model_name: "gpt-5.4",
+            created_at: "2026-08-05T00:00:00+00:00",
+            updated_at: "2026-08-05T00:00:00+00:00",
+          }],
+        }));
+      }
+      if (url === "http://api.test/api/threads") {
+        return Promise.resolve(createThreadResponse());
+      }
+      if (url === "http://api.test/api/threads/thread-1/messages") {
+        return Promise.resolve(jsonResponse(threadState({
+          run: {
+            state: "done",
+            steps: 1,
+            error: null,
+            error_code: null,
+            user_message: null,
+            started_at: null,
+            updated_at: null,
+          },
+          conversation: [
+            { id: "user-1", role: "user", text: "Check concurrency" },
+            { id: "assistant-1", role: "assistant", text: "Agent response ready" },
+          ],
+        })));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(historyRequests).toBe(1);
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Check concurrency" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Agent response ready")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Untitled conversation" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(historyRequests).toBe(3);
+    expect(
+      screen.getByRole("button", { name: "Untitled conversation" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(
+      screen.getByRole("button", { name: "Concurrent response check" }),
+    ).toBeInTheDocument();
+    const stoppedAt = historyRequests;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(historyRequests).toBe(stoppedAt);
+  });
+
+  it("stops title refresh when the active conversation is replaced", async () => {
+    vi.useFakeTimers();
+    let historyRequests = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        historyRequests += 1;
+        return Promise.resolve(jsonResponse({
+          items: historyRequests === 1 ? [] : [{
+            thread_id: "thread-1",
+            title: "Untitled conversation",
+            title_source: "automatic",
+            model_name: "gpt-5.4",
+            created_at: "2026-08-05T00:00:00+00:00",
+            updated_at: "2026-08-05T00:00:00+00:00",
+          }],
+        }));
+      }
+      if (url === "http://api.test/api/threads") {
+        return Promise.resolve(createThreadResponse());
+      }
+      if (url === "http://api.test/api/threads/thread-1/messages") {
+        return Promise.resolve(jsonResponse(threadState({
+          run: {
+            state: "done",
+            steps: 1,
+            error: null,
+            error_code: null,
+            user_message: null,
+            started_at: null,
+            updated_at: null,
+          },
+        })));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(historyRequests).toBe(1);
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Check cancellation" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    screen.getByRole("button", { name: "Untitled conversation" });
+    fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
+    const stoppedAt = historyRequests;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(historyRequests).toBe(stoppedAt);
   });
 
   it("keeps DB-RAG review controls out of the sidebar", async () => {
@@ -1213,7 +2453,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-1/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ action: "cancel" }),
       },
     );
@@ -1227,6 +2467,7 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
       "http://api.test/api/threads/thread-1/state",
+      { headers: expect.any(Headers) },
     );
     expect(composer).toBeEnabled();
     expect(
@@ -1244,7 +2485,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ text: "Start a new task" }),
       },
     );
@@ -1261,6 +2502,56 @@ describe("App", () => {
     await screen.findByLabelText("Ask a question about your dataset!");
     expect(screen.queryByLabelText("Show debug state")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Debug state")).not.toBeInTheDocument();
+  });
+
+  it("starts a new conversation while the selected thread is running", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "running",
+              steps: 1,
+              error: null,
+              error_code: null,
+              user_message: null,
+              started_at: 1,
+              updated_at: 1,
+            },
+            conversation: [
+              { id: "running-user", role: "user", text: "Long analysis" },
+            ],
+          }),
+        ),
+      );
+
+    render(
+      <App
+        apiBase="http://api.test"
+        fetchImpl={fetchMock}
+        loadConversationHistory={false}
+      />,
+    );
+    fireEvent.change(
+      await screen.findByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Long analysis" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: "Cancel run" });
+
+    const newConversation = screen.getByRole("button", {
+      name: "New conversation",
+    });
+    expect(newConversation).toBeEnabled();
+    fireEvent.click(newConversation);
+
+    expect(screen.queryByText("Long analysis")).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Ask a question about your dataset!"),
+    ).toBeEnabled();
   });
 
   it("polls while a submitted message is running and renders the final state", async () => {
@@ -1282,9 +2573,6 @@ describe("App", () => {
             conversation: [
               { id: "user-1", role: "user", text: "Find NIH grants" },
             ],
-            diagnostics: {
-              next_action: "needs_code",
-            },
           }),
         ),
       )
@@ -1351,11 +2639,235 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
       "http://api.test/api/threads/thread-1/state",
+      { headers: expect.any(Headers) },
     );
+  });
+
+  it("refreshes the saved conversation when a running thread reaches review", async () => {
+    vi.useFakeTimers();
+    let conversationRequests = 0;
+    const summary = {
+      thread_id: "thread-1",
+      title: "Generated review title",
+      title_source: "automatic",
+      model_name: "gpt-5.6-terra",
+      created_at: "2026-08-21T00:00:00+00:00",
+      updated_at: "2026-08-21T00:00:00+00:00",
+      last_opened_at: null,
+      archived_at: null,
+      awaiting_review: false,
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://api.test/api/runtime/options") {
+        return Promise.resolve(runtimeOptionsResponse());
+      }
+      if (url === "http://api.test/api/conversations") {
+        conversationRequests += 1;
+        return Promise.resolve(jsonResponse({
+          items: conversationRequests === 1
+            ? []
+            : [{ ...summary, awaiting_review: conversationRequests > 2 }],
+        }));
+      }
+      if (url === "http://api.test/api/threads" && init?.method === "POST") {
+        return Promise.resolve(createThreadResponse());
+      }
+      if (
+        url === "http://api.test/api/threads/thread-1/messages" &&
+        init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse(threadState({
+          run: {
+            state: "running",
+            steps: 1,
+            error: null,
+            error_code: null,
+            user_message: null,
+            started_at: 1,
+            updated_at: 1,
+          },
+          conversation: [{ id: "user-1", role: "user", text: "Build a dataset" }],
+        })));
+      }
+      if (url === "http://api.test/api/threads/thread-1/state") {
+        return Promise.resolve(jsonResponse(reviewState()));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(
+      screen.getByLabelText("Ask a question about your dataset!"),
+      { target: { value: "Build a dataset" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "Generated review title" }))
+      .toBeInTheDocument();
+    expect(screen.queryByText("Awaiting review")).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    expect(screen.getByText("Awaiting review")).toBeInTheDocument();
+  });
+
+  it("cancels a running turn, retains its message, and re-enables the composer", async () => {
+    const cancelResponse = deferred<Response>();
+    const runningState = threadState({
+      run: {
+        state: "running",
+        steps: 1,
+        error: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        { id: "user-1", role: "user", text: "Analyze the cohort" },
+      ],
+    });
+    const cancelledState = threadState({
+      run: {
+        state: "cancelled",
+        steps: 1,
+        error: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        {
+          id: "user-1",
+          role: "user",
+          text: "Analyze the cohort",
+          status: "cancelled",
+        },
+      ],
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(jsonResponse(runningState))
+      .mockReturnValueOnce(cancelResponse.promise);
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+
+    fireEvent.change(await screen.findByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Analyze the cohort" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
+
+    expect(screen.getByRole("button", { name: "Cancelling run" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://api.test/api/threads/thread-1/cancel",
+      { method: "POST", headers: expect.any(Headers) },
+    );
+
+    cancelResponse.resolve(jsonResponse(cancelledState));
+
+    expect(await screen.findByText("Cancelled")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ask a question about your dataset!")).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Continue where we left off" },
+    });
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+  });
+
+  it("ignores a poll response that finishes after cancellation", async () => {
+    vi.useFakeTimers();
+    const firstPoll = deferred<Response>();
+    const runningState = threadState({
+      run: {
+        state: "running",
+        steps: 1,
+        error: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [{ id: "user-1", role: "user", text: "Analyze the cohort" }],
+    });
+    const cancelledState = threadState({
+      run: {
+        state: "cancelled",
+        steps: 1,
+        error: null,
+        started_at: null,
+        updated_at: null,
+      },
+      conversation: [
+        {
+          id: "user-1",
+          role: "user",
+          text: "Analyze the cohort",
+          status: "cancelled",
+        },
+      ],
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeOptionsResponse())
+      .mockResolvedValueOnce(createThreadResponse())
+      .mockResolvedValueOnce(jsonResponse(runningState))
+      .mockReturnValueOnce(firstPoll.promise)
+      .mockResolvedValueOnce(jsonResponse(cancelledState));
+
+    render(<App apiBase="http://api.test" fetchImpl={fetchMock} loadConversationHistory={false} />);
+    await act(async () => Promise.resolve());
+    fireEvent.change(screen.getByLabelText("Ask a question about your dataset!"), {
+      target: { value: "Analyze the cohort" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+
+    await act(async () => {
+      firstPoll.resolve(
+        jsonResponse(
+          threadState({
+            run: {
+              state: "done",
+              steps: 4,
+              error: null,
+              started_at: null,
+              updated_at: null,
+            },
+            conversation: [
+              { id: "user-1", role: "user", text: "Analyze the cohort" },
+              { id: "assistant-late", role: "assistant", text: "Late result" },
+            ],
+          }),
+        ),
+      );
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Late result")).not.toBeInTheDocument();
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
   });
 
   it("keeps generated figure previews stable when polling repeats the same visible state", async () => {
     vi.useFakeTimers();
+    Object.defineProperties(URL, {
+      createObjectURL: { configurable: true, value: vi.fn(() => "blob:figure") },
+      revokeObjectURL: { configurable: true, value: vi.fn() },
+    });
     const runningState = threadState({
       run: {
         state: "running",
@@ -1407,6 +2919,9 @@ describe("App", () => {
       if (url === "http://api.test/api/threads/thread-1/state") {
         return Promise.resolve(jsonResponse(repeatedRunningState));
       }
+      if (url === "http://api.test/api/threads/thread-1/attachments/figure-1") {
+        return Promise.resolve(new Response("figure", { status: 200 }));
+      }
       return Promise.reject(
         new Error(`Unexpected request: ${String(init?.method ?? "GET")} ${url}`),
       );
@@ -1428,14 +2943,22 @@ describe("App", () => {
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
     });
     const figure = screen.getByRole("img", {
       name: "Figure generated by approved final output.",
     });
     expect(figure).toHaveAttribute(
       "src",
-      "http://api.test/api/threads/thread-1/attachments/figure-1",
+      "blob:figure",
     );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => url === "http://api.test/api/threads/thread-1/attachments/figure-1",
+      ),
+    ).toHaveLength(2);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1000);
@@ -1447,7 +2970,7 @@ describe("App", () => {
         ([url]) =>
           url === "http://api.test/api/threads/thread-1/attachments/figure-1",
       ),
-    ).toHaveLength(0);
+    ).toHaveLength(2);
     expect(
       screen.getByRole("img", {
         name: "Figure generated by approved final output.",
@@ -1550,6 +3073,7 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://api.test/api/runtime/options",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -1629,7 +3153,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-1/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({
           action: "approve",
           selected_column_keys: ["projects.project_id"],
@@ -1710,7 +3234,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-clarification/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({
           action: "answer",
           answer: "Use the 12-month visit.",
@@ -1791,7 +3315,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-clarification/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ action: "cancel" }),
       },
     );
@@ -1808,7 +3332,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({
           text: "Start a different task",
         }),
@@ -1870,7 +3394,7 @@ describe("App", () => {
     expect(screen.getByText("Let the agent decide.")).toBeInTheDocument();
   });
 
-  it("disables submit and review controls while a run is in flight", async () => {
+  it("disables composer and review controls while keeping cancellation available", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(runtimeOptionsResponse())
@@ -1917,7 +3441,8 @@ describe("App", () => {
     expect(screen.getByLabelText("Agent activity")).toHaveTextContent(
       "Agent is working",
     );
-    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Send" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Request revision" })).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Approve plan and extract" }),
@@ -1973,7 +3498,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-1/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({
           action: "revise",
           feedback: "Prefer title fields.",
@@ -2032,10 +3557,15 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
       "http://api.test/api/threads/thread-1/state",
+      { headers: expect.any(Headers) },
     );
   });
 
   it("renders downloadable figure and dataset outputs inside the assistant message", async () => {
+    Object.defineProperties(URL, {
+      createObjectURL: { configurable: true, value: vi.fn(() => "blob:artifact") },
+      revokeObjectURL: { configurable: true, value: vi.fn() },
+    });
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(runtimeOptionsResponse())
@@ -2119,7 +3649,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(
-      await screen.findByRole("heading", { name: "AI Agent for RePORT" }),
+      await screen.findByRole("heading", {
+        name: "Epidemiology Research Agent",
+      }),
     ).toBeInTheDocument();
     expect(await screen.findByText("SELECT 1;")).toBeInTheDocument();
     expect(screen.queryByText("Generated datasets")).not.toBeInTheDocument();
@@ -2127,28 +3659,23 @@ describe("App", () => {
       screen.queryByText(["Generated", "files"].join(" ")),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("img", {
+      await screen.findByRole("img", {
         name: "Figure generated by approved final output.",
       }),
     ).toHaveAttribute(
       "src",
-      "http://api.test/api/threads/thread-1/attachments/figure-1",
+      "blob:artifact",
     );
-    expect(
-      screen.getByRole("link", {
-        name: "Download figure",
-      }),
-    ).toHaveAttribute(
-      "href",
-      "http://api.test/api/threads/thread-1/attachments/figure-1",
-    );
-    expect(
-      screen.getByRole("link", { name: "Download" }),
-    ).toHaveAttribute(
-      "href",
-      "http://api.test/api/threads/thread-1/attachments/subset-1",
-    );
+    expect(await screen.findByRole("button", { name: "Download figure" })).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "Download LTFU subset" })).toBeEnabled();
 
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        columns: ["subject_id"],
+        rows: [{ subject_id: "SUB-1" }],
+        row_count: 1,
+      }),
+    );
     fireEvent.click(screen.getByText("Dataset details", { selector: "summary" }));
 
     expect(await screen.findByText("SUB-1")).toBeInTheDocument();
@@ -2320,7 +3847,7 @@ describe("App", () => {
       "http://api.test/api/threads",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ model_name: "gpt-5.4-mini" }),
       },
     );
@@ -2329,7 +3856,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-2/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ text: "New question" }),
       },
     );
@@ -2448,7 +3975,7 @@ describe("App", () => {
       "http://api.test/api/threads/thread-1/interrupts/interrupt-analysis/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ action: "approve" }),
       },
     );
@@ -2527,14 +4054,14 @@ describe("App", () => {
         target: { value: "Use only baseline rows." },
       },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Submit feedback" }));
+    fireEvent.click(screen.getByRole("button", { name: "Request revision" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenLastCalledWith(
         "http://api.test/api/threads/thread-1/interrupts/interrupt-dataset/resume",
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: expect.any(Headers),
           body: JSON.stringify({
             action: "revise",
             feedback: "Use only baseline rows.",
@@ -2616,7 +4143,7 @@ describe("App", () => {
         "http://api.test/api/threads/thread-1/interrupts/interrupt-dataset-cancel/resume",
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: expect.any(Headers),
           body: JSON.stringify({ action: "cancel" }),
         },
       );

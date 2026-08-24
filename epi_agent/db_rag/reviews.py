@@ -13,7 +13,11 @@ from db_rag.review_contracts import (
 )
 from db_rag.relationships import reverse_relationship_warning_code
 from db_rag.service.dataset_naming import deterministic_dataset_name
-from epi_agent.artifacts import DatasetPlan, StateArtifactStore
+from epi_agent.artifacts import (
+    DatasetPlan,
+    StateArtifactStore,
+    dataset_plan_from_artifact,
+)
 from epi_agent.db_rag.quality import DatasetQualityReport
 from epi_agent.protocol import (
     ArtifactRef,
@@ -463,6 +467,7 @@ def _data_linkage_payload(
     plan: DatasetPlan,
     context: ToolContext,
 ) -> dict[str, Any]:
+    study = require_context_study(context, plan.study_id)
     relationships: list[dict[str, Any]] = []
     shown_edges: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
     for value in plan.operations:
@@ -541,7 +546,7 @@ def _data_linkage_payload(
     try:
         from epi_agent.db_rag.tools import _verified_join_paths
 
-        for edge in _verified_join_paths(plan, context):
+        for edge in _verified_join_paths(plan, study):
             profile = edge.get("profile")
             key_pairs = list(edge.get("key_pairs") or [])
             edge_key = (
@@ -600,7 +605,7 @@ def _data_linkage_payload(
                     }
                 )
             relationships.append(relationship)
-    except (ToolExecutionError, KeyError, ValueError):
+    except (KeyError, ValueError):
         pass
     return {"relationships": relationships}
 
@@ -650,7 +655,7 @@ def _validate_plan(
     temporary_store = StateArtifactStore(context.artifact_store.snapshot())
     temporary_ref = temporary_store.save_dataset_plan(plan)
     temporary_context = ToolContext(
-        study=context.study,
+        studies=context.studies,
         artifact_store=temporary_store,
         thread_id=context.thread_id,
         policy=context.policy,
@@ -708,7 +713,7 @@ class RequestDatasetPlanReviewTool:
             {"plan_id": plan_id, "plan_version": version},
             context,
         )
-        plan = DatasetPlan.model_validate(stored.content)
+        plan = dataset_plan_from_artifact(stored)
         payload = {
             "type": "dataset_plan_review",
             "artifact": {
@@ -790,7 +795,7 @@ class RequestDatasetPlanReviewTool:
                     prior_id=plan_id,
                     prior_version=version,
                     provenance={
-                        "study_id": require_context_study(context).study_id,
+                        "study_id": candidate.study_id,
                         "thread_id": context.thread_id,
                         "producer": "dbrag-request_dataset_plan_review",
                         "review_action": "approve_selected_plan",
@@ -824,7 +829,7 @@ class RequestDatasetPlanReviewTool:
             prior_id=plan_id,
             prior_version=version,
             provenance={
-                "study_id": require_context_study(context).study_id,
+                "study_id": candidate.study_id,
                 "thread_id": context.thread_id,
                 "producer": "dbrag-request_dataset_plan_review",
                 "review_action": "revise",
@@ -1016,7 +1021,17 @@ class RequestDatasetReviewTool:
                 "Dataset review requires the exact approved dataset plan.",
                 recoverable=True,
             )
-        plan = DatasetPlan.model_validate(plan_artifact.content)
+        plan = dataset_plan_from_artifact(plan_artifact)
+        if (
+            provenance.get("study_id") != plan.study_id
+            or quality.provenance.get("study_id") != plan.study_id
+        ):
+            raise ToolExecutionError(
+                "STUDY_REFERENCE_MISMATCH",
+                "Dataset, quality report, and approved plan must identify "
+                "the same study.",
+                recoverable=True,
+            )
         payload = {
             "type": "dataset_review",
             "artifact": {
@@ -1116,6 +1131,7 @@ class RequestDatasetReviewTool:
                 },
                 provenance={
                     "producer": "dbrag-request_dataset_review",
+                    "study_id": plan.study_id,
                     "thread_id": context.thread_id,
                     "dataset": {
                         "id": dataset.id,

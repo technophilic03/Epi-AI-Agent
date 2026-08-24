@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import re
 from collections import deque
 from pathlib import Path
 from typing import Literal
 
 import duckdb
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-
-_IDENTIFIER_COLUMN = re.compile(
-    r"(?:^|_)[A-Z0-9]*ID[0-9]*(?:_PSEUDO)?$"
+from db_rag.catalog_relationships import (
+    Cardinality,
+    CatalogRelationshipSpec,
+    RelationshipAuthorization,
+    reverse_expected_cardinality,
 )
 
 
@@ -24,8 +25,24 @@ class IdentifierProfile(BaseModel):
 class TableRelationshipInventory(BaseModel):
     table: str
     row_count: int
+    columns: list[str]
+    relationship_keys: dict[str, str]
     identifier_columns: list[str]
     identifiers: dict[str, IdentifierProfile]
+
+
+class RelationshipEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    left_column: str
+    right_column: str
+    left_join_key: str
+    right_join_key: str
+    source: Literal["shared_join_key", "declared_relationship"]
+    relationship_id: str | None = None
+    expected_cardinality: Cardinality | None = None
+    note: str | None = None
+    direction: Literal["forward", "reverse"] | None = None
 
 
 class RelationshipProfile(BaseModel):
@@ -39,6 +56,7 @@ class RelationshipProfile(BaseModel):
     left_cardinality: Literal["one", "many"]
     right_cardinality: Literal["one", "many"]
     warnings: list[str]
+    relationship_evidence: list[RelationshipEvidence]
 
 
 class JoinPath(BaseModel):
@@ -50,14 +68,38 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def _is_identifier_column(column: str) -> bool:
-    return _IDENTIFIER_COLUMN.search(column.upper()) is not None
-
-
 def _nonnull_condition(alias: str, columns: list[str]) -> str:
     return " AND ".join(
         f"{alias}.{_quote_identifier(column)} IS NOT NULL" for column in columns
     )
+
+
+def _relationship_evidence(
+    authorization: RelationshipAuthorization,
+) -> RelationshipEvidence:
+    return RelationshipEvidence(
+        left_column=authorization.left_endpoint.column,
+        right_column=authorization.right_endpoint.column,
+        left_join_key=authorization.left_endpoint.join_key,
+        right_join_key=authorization.right_endpoint.join_key,
+        source=authorization.source,
+        relationship_id=authorization.relationship_id,
+        expected_cardinality=authorization.expected_cardinality,
+        note=authorization.note,
+        direction=authorization.direction,
+    )
+
+
+def _unordered_edge(
+    left_table: str,
+    left_column: str,
+    right_table: str,
+    right_column: str,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    endpoints = sorted(
+        ((left_table, left_column), (right_table, right_column))
+    )
+    return endpoints[0], endpoints[1]
 
 
 class RelationshipInventory:
@@ -65,9 +107,11 @@ class RelationshipInventory:
         self,
         duckdb_path: Path,
         tables: list[TableRelationshipInventory],
+        specification: CatalogRelationshipSpec,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.tables = tables
+        self.specification = specification
         self._tables_by_name = {table.table: table for table in tables}
         self._candidate_profiles: list[RelationshipProfile] | None = None
 
@@ -89,13 +133,30 @@ class RelationshipInventory:
         right = self.require_table(right_table)
         left_columns = [pair[0] for pair in key_pairs]
         right_columns = [pair[1] for pair in key_pairs]
-        missing_left = [column for column in left_columns if column not in left.identifiers]
-        missing_right = [column for column in right_columns if column not in right.identifiers]
-        if missing_left or missing_right:
-            raise KeyError(
-                "Relationship keys must be profiled identifier columns: "
-                f"left={missing_left}, right={missing_right}"
+        authorizations = [
+            self.specification.authorize_pair(
+                left_table,
+                left_column,
+                right_table,
+                right_column,
             )
+            for left_column, right_column in key_pairs
+        ]
+        unauthorized = [
+            pair
+            for pair, authorization in zip(key_pairs, authorizations, strict=True)
+            if authorization is None
+        ]
+        if unauthorized:
+            raise KeyError(
+                "Relationship keys are not authorized by the study catalog: "
+                f"{unauthorized}"
+            )
+        evidence = [
+            _relationship_evidence(authorization)
+            for authorization in authorizations
+            if authorization is not None
+        ]
 
         left_table_sql = _quote_identifier(left_table)
         right_table_sql = _quote_identifier(right_table)
@@ -205,26 +266,91 @@ class RelationshipInventory:
             left_cardinality="many" if int(left_max) > 1 else "one",
             right_cardinality="many" if int(right_max) > 1 else "one",
             warnings=warnings,
+            relationship_evidence=evidence,
         )
 
     def candidate_relationships(self) -> list[RelationshipProfile]:
         if self._candidate_profiles is None:
             candidates: list[RelationshipProfile] = []
+            seen_edges: set[
+                tuple[tuple[str, str], tuple[str, str]]
+            ] = set()
+
+            for relationship in self.specification.relationships:
+                left = relationship.from_endpoint
+                right = relationship.to_endpoint
+                edge = _unordered_edge(
+                    left.table,
+                    left.column,
+                    right.table,
+                    right.column,
+                )
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                profile = self.profile_relationship(
+                    left.table,
+                    right.table,
+                    [(left.column, right.column)],
+                )
+                if profile.matched_keys:
+                    candidates.append(profile)
+
             for left_index, left in enumerate(self.tables):
                 for right in self.tables[left_index + 1 :]:
-                    shared_columns = sorted(
-                        set(left.identifier_columns) & set(right.identifier_columns)
+                    shared_keys = sorted(
+                        set(left.relationship_keys) & set(right.relationship_keys)
                     )
-                    for column in shared_columns:
+                    for key_id in shared_keys:
+                        pair = (
+                            left.relationship_keys[key_id],
+                            right.relationship_keys[key_id],
+                        )
+                        edge = _unordered_edge(
+                            left.table,
+                            pair[0],
+                            right.table,
+                            pair[1],
+                        )
+                        if edge in seen_edges:
+                            continue
+                        seen_edges.add(edge)
                         profile = self.profile_relationship(
                             left.table,
                             right.table,
-                            [(column, column)],
+                            [pair],
                         )
                         if profile.matched_keys:
                             candidates.append(profile)
             self._candidate_profiles = candidates
         return list(self._candidate_profiles)
+
+    def validate_declared_relationships(self) -> None:
+        for relationship in self.specification.relationships:
+            profile = self.profile_relationship(
+                relationship.from_endpoint.table,
+                relationship.to_endpoint.table,
+                [
+                    (
+                        relationship.from_endpoint.column,
+                        relationship.to_endpoint.column,
+                    )
+                ],
+            )
+            if profile.matched_keys < 1:
+                raise ValueError(
+                    f"relationship {relationship.relationship_id} "
+                    "has no matched non-null keys"
+                )
+            observed = (
+                f"{profile.left_cardinality}_to_{profile.right_cardinality}"
+            )
+            if observed != relationship.expected_cardinality:
+                raise ValueError(
+                    f"relationship {relationship.relationship_id} expected "
+                    f"cardinality {relationship.expected_cardinality} but "
+                    f"observed {observed}"
+                )
 
     def find_join_paths(
         self,
@@ -295,12 +421,41 @@ def _reverse_profile(profile: RelationshipProfile) -> RelationshipProfile:
             reverse_relationship_warning_code(warning)
             for warning in profile.warnings
         ],
+        relationship_evidence=[
+            RelationshipEvidence(
+                left_column=evidence.right_column,
+                right_column=evidence.left_column,
+                left_join_key=evidence.right_join_key,
+                right_join_key=evidence.left_join_key,
+                source=evidence.source,
+                relationship_id=evidence.relationship_id,
+                expected_cardinality=(
+                    reverse_expected_cardinality(evidence.expected_cardinality)
+                    if evidence.expected_cardinality is not None
+                    else None
+                ),
+                note=evidence.note,
+                direction=(
+                    "reverse"
+                    if evidence.direction == "forward"
+                    else "forward"
+                    if evidence.direction == "reverse"
+                    else None
+                ),
+            )
+            for evidence in profile.relationship_evidence
+        ],
     )
 
 
-def build_relationship_inventory(duckdb_path: Path) -> RelationshipInventory:
+def build_relationship_inventory(
+    duckdb_path: Path,
+    *,
+    relationship_spec: CatalogRelationshipSpec,
+) -> RelationshipInventory:
     path = Path(duckdb_path)
     tables: list[TableRelationshipInventory] = []
+    declared_relationship_keys = relationship_spec.table_keys
     with duckdb.connect(str(path), read_only=True) as connection:
         table_names = [
             str(row[0])
@@ -313,6 +468,12 @@ def build_relationship_inventory(duckdb_path: Path) -> RelationshipInventory:
                 """
             ).fetchall()
         ]
+        missing_tables = sorted(set(declared_relationship_keys) - set(table_names))
+        if missing_tables:
+            raise ValueError(
+                "Catalog relationship declaration references missing DuckDB "
+                f"table(s): {missing_tables}"
+            )
         for table_name in table_names:
             columns = [
                 str(row[0])
@@ -326,9 +487,20 @@ def build_relationship_inventory(duckdb_path: Path) -> RelationshipInventory:
                     [table_name],
                 ).fetchall()
             ]
-            identifier_columns = sorted(
-                column for column in columns if _is_identifier_column(column)
+            table_relationship_keys = declared_relationship_keys.get(table_name, {})
+            missing_columns = sorted(
+                {
+                    column
+                    for column in table_relationship_keys.values()
+                    if column not in columns
+                }
             )
+            if missing_columns:
+                raise ValueError(
+                    "Catalog relationship declaration references missing DuckDB "
+                    f"column(s) for {table_name}: {missing_columns}"
+                )
+            identifier_columns = sorted(set(table_relationship_keys.values()))
             table_sql = _quote_identifier(table_name)
             row_count = int(
                 connection.execute(f"SELECT COUNT(*) FROM {table_sql}").fetchone()[0]
@@ -354,11 +526,13 @@ def build_relationship_inventory(duckdb_path: Path) -> RelationshipInventory:
                 TableRelationshipInventory(
                     table=table_name,
                     row_count=row_count,
+                    columns=columns,
+                    relationship_keys=table_relationship_keys,
                     identifier_columns=identifier_columns,
                     identifiers=identifiers,
                 )
             )
-    return RelationshipInventory(path, tables)
+    return RelationshipInventory(path, tables, relationship_spec)
 
 
 def profile_relationship(
@@ -366,8 +540,13 @@ def profile_relationship(
     left_table: str,
     right_table: str,
     key_pairs: list[tuple[str, str]],
+    *,
+    relationship_spec: CatalogRelationshipSpec,
 ) -> RelationshipProfile:
-    return build_relationship_inventory(duckdb_path).profile_relationship(
+    return build_relationship_inventory(
+        duckdb_path,
+        relationship_spec=relationship_spec,
+    ).profile_relationship(
         left_table,
         right_table,
         key_pairs,
@@ -381,8 +560,12 @@ def find_join_paths(
     *,
     max_hops: int = 3,
     max_paths: int = 20,
+    relationship_spec: CatalogRelationshipSpec,
 ) -> list[JoinPath]:
-    return build_relationship_inventory(duckdb_path).find_join_paths(
+    return build_relationship_inventory(
+        duckdb_path,
+        relationship_spec=relationship_spec,
+    ).find_join_paths(
         left_table,
         right_table,
         max_hops=max_hops,

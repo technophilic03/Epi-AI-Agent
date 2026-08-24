@@ -20,6 +20,7 @@ from epi_agent.runtimes.python.models import (
     PythonRuntimeFailure,
 )
 from tools.execution_policy import validate_generated_code
+from utils.run_cancellation import RunCancelled, cancellation_point
 
 
 MAX_STDOUT_BYTES = 100_000
@@ -345,10 +346,6 @@ class LocalPythonRuntime:
                     "PYTHONUTF8": "1",
                     "MPLBACKEND": "Agg",
                     "MPLCONFIGDIR": str(run_dir / "matplotlib"),
-                    # BLAS/OpenMP thread pools must fit inside RLIMIT_NPROC
-                    # (which counts the user's processes machine-wide); one
-                    # thread keeps numpy/scipy imports from failing with
-                    # "pthread_create failed: Resource temporarily unavailable".
                     "OPENBLAS_NUM_THREADS": "1",
                     "OMP_NUM_THREADS": "1",
                     "MKL_NUM_THREADS": "1",
@@ -359,11 +356,15 @@ class LocalPythonRuntime:
             command = [
                 sys.executable,
                 str(Path(__file__).with_name("worker.py")),
-                "--input-dir",
-                str(input_dir),
-                "--output-dir",
-                str(output_dir),
             ]
+            command.extend(
+                [
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
             started = time.monotonic()
             try:
                 process = subprocess.Popen(
@@ -379,9 +380,26 @@ class LocalPythonRuntime:
                         memory_limit_bytes=self._memory_limit_bytes,
                     ),
                 )
-                _child_stdout, child_stderr = process.communicate(
-                    timeout=self._timeout_seconds
-                )
+                deadline = started + self._timeout_seconds
+                while True:
+                    cancellation_point()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(
+                            command,
+                            self._timeout_seconds,
+                        )
+                    try:
+                        _child_stdout, child_stderr = process.communicate(
+                            timeout=min(0.1, remaining),
+                        )
+                        cancellation_point()
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except RunCancelled:
+                _terminate_process_group(process)
+                raise
             except subprocess.TimeoutExpired as exc:
                 _terminate_process_group(process)
                 raise _failure(

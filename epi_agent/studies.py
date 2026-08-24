@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class StudySourceUnavailableError(RuntimeError):
@@ -16,6 +16,12 @@ class StudyKnowledgeProvider(Protocol):
 class StudyDesignProvider(Protocol):
     def render_context(self) -> str:
         """Return bounded authoritative context for the active study."""
+
+
+@runtime_checkable
+class SearchableStudyDesignProvider(StudyDesignProvider, Protocol):
+    def search(self, query: str, limit: int = 5) -> tuple[object, ...]:
+        """Return bounded study-design retrieval hits."""
 
 
 class StudyCatalogProvider(Protocol):
@@ -38,6 +44,7 @@ class StudyBundle:
     description: str | None = None
     source_id: str = ""
     db_rag_paths: object | None = None
+    study_overview: StudyDesignProvider | None = None
 
 
 class StudyRegistry:
@@ -58,10 +65,9 @@ class StudyRegistry:
     def values(self) -> tuple[StudyBundle, ...]:
         return tuple(self._studies.values())
 
-    def sole_study_id(self) -> str | None:
-        if len(self._studies) != 1:
-            return None
-        return next(iter(self._studies))
+    @property
+    def ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._studies))
 
     def require(self, study_id: str) -> StudyBundle:
         try:

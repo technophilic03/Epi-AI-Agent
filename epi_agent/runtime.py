@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RunnableConfig, interrupt
 
+from epi_agent.activity import ActivitySink, NULL_ACTIVITY_SINK, notify_activity
 from epi_agent.artifacts import StateArtifactStore
 from epi_agent.model_responses import (
     ModelResponseProtocolError,
@@ -35,6 +36,12 @@ from epi_agent.protocol import (
 )
 from epi_agent.registry import ToolRegistry
 from epi_agent.studies import StudyRegistry
+from epi_agent.tool_call_protocol import (
+    aborted_tool_messages,
+    error_tool_message,
+    internal_tool_error,
+    tool_error_content as _tool_error_content,
+)
 from graph.conversation_events import (
     append_conversation_event,
     build_assistant_event,
@@ -44,6 +51,7 @@ from graph.conversation_events import (
 from graph.state import LangChainAgentState
 from graph.state import MetaKeys
 from utils.model_runtime_profiles import ModelRuntimeProfile
+from utils.run_cancellation import RunCancelled, cancellation_point
 from utils.runtime_defaults import DEFAULT_EPI_AGENT_MAX_ITERATIONS
 
 
@@ -62,7 +70,6 @@ _DATASET_ARTIFACT_KINDS = {
 
 
 class GenericEpiAgentState(LangChainAgentState):
-    active_study_id: str
     artifact_ids: list[str]
     artifacts: dict[str, Any]
     final_response: str | None
@@ -76,8 +83,8 @@ class GenericEpiAgentState(LangChainAgentState):
     terminal_error: NotRequired[dict[str, Any]]
     terminal_control: NotRequired[dict[str, Any]]
     completion_blocked: NotRequired[bool]
-    agent_status: NotRequired[dict[str, Any]]
     model_output_state: NotRequired[dict[str, Any]]
+    cancelled_turn: NotRequired[dict[str, Any]]
 
 
 ToolContextFactory = Callable[
@@ -89,6 +96,10 @@ ToolSuccessStateReducer = Callable[
     [dict[str, Any], str, dict[str, Any], ToolResult],
     dict[str, Any],
 ]
+
+
+class ContextPromptError(RuntimeError):
+    """Dynamic model context cannot be constructed safely."""
 
 
 def _no_tool_success_state_patch(
@@ -108,6 +119,7 @@ class EpiAgentRuntimeConfig:
     studies: StudyRegistry
     context_factory: ToolContextFactory
     model_profile: ModelRuntimeProfile
+    activity_sink: ActivitySink = NULL_ACTIVITY_SINK
     completion_issues: CompletionIssues = lambda _state: []
     context_prompt_factory: ContextPromptFactory = lambda _state: ""
     tool_success_state_reducer: ToolSuccessStateReducer = (
@@ -125,11 +137,6 @@ def _terminal_model_patch(error: dict[str, Any]) -> dict[str, Any]:
         "messages": [AIMessage(content="")],
         "terminal_error": error,
         "completion_blocked": False,
-        "agent_status": {
-            "status": "error",
-            "run_status": "error",
-            "terminal_error": error,
-        },
     }
 
 
@@ -139,17 +146,6 @@ def _failure_signature(code: str, name: str, arguments: dict[str, Any]) -> str:
         default=str,
         sort_keys=True,
     )
-
-
-def _tool_error_content(error: ToolExecutionError) -> str:
-    error_payload: dict[str, Any] = {
-        "code": error.code,
-        "message": str(error),
-        "recoverable": error.recoverable,
-    }
-    if error.details is not None:
-        error_payload["details"] = error.details
-    return json.dumps({"error": error_payload}, sort_keys=True)
 
 
 def _failure_record(signature: str) -> dict[str, Any]:
@@ -282,13 +278,29 @@ def _model_output_error_patch(
     }
 
 
-def _insert_context_before_latest_human(
+def _insert_fresh_context(
     messages: list[Any],
-    context: SystemMessage,
+    context: HumanMessage,
 ) -> list[Any]:
+    latest_response_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, AIMessage):
+            continue
+        response_id = str(message.response_metadata.get("id") or "")
+        if response_id.startswith("resp_"):
+            latest_response_index = index
+            break
+
     for index in range(len(messages) - 1, -1, -1):
         if isinstance(messages[index], HumanMessage):
-            return [*messages[:index], context, *messages[index:]]
+            if index > latest_response_index:
+                return [*messages[:index], context, *messages[index:]]
+            break
+
+    # Responses API compaction sends only messages after the latest resp_* AI
+    # message. During a tool loop, append refreshed context after tool outputs
+    # so it remains in that transmitted suffix.
     return [*messages, context]
 
 
@@ -344,11 +356,19 @@ def _prepare_model_request(
     output_state = dict(state.get("model_output_state") or {})
     phase = str(output_state.get("phase") or "idle")
     state_messages = list(state.get("messages") or [])
-    context_prompt = agent_config.context_prompt_factory(state).strip()
+    try:
+        context_prompt = agent_config.context_prompt_factory(state).strip()
+    except ContextPromptError as error:
+        return _terminal_model_patch(
+            _terminal_error(
+                "CONTEXT_CONFIGURATION_ERROR",
+                str(error),
+            )
+        )
     if context_prompt:
-        state_messages = _insert_context_before_latest_human(
+        state_messages = _insert_fresh_context(
             state_messages,
-            SystemMessage(content=context_prompt),
+            HumanMessage(content=context_prompt),
         )
     continuation_messages: list[SystemMessage] = []
     if phase in {"automatic", "authorized"}:
@@ -391,6 +411,15 @@ def _prepare_model_request(
     return iteration_count, output_state, phase, messages, budget
 
 
+def _activity_thread_id(config: RunnableConfig) -> str:
+    configurable = dict(config.get("configurable") or {})
+    return str(
+        configurable.get("conversation_thread_id")
+        or configurable.get("thread_id")
+        or ""
+    )
+
+
 def _call_model(
     state: dict[str, Any],
     config: RunnableConfig,
@@ -398,21 +427,28 @@ def _call_model(
     agent_config: EpiAgentRuntimeConfig,
     model: Any,
 ) -> dict[str, Any]:
+    cancellation_point()
     prepared = _prepare_model_request(state, agent_config=agent_config)
     if isinstance(prepared, dict):
         return prepared
     iteration_count, output_state, phase, messages, budget = prepared
     started_at = time.perf_counter()
-    answer = model.bind_tools(agent_config.registry.model_schemas()).invoke(
-        messages,
-        config=config,
-        **agent_config.model_profile.output_budget_kwargs(budget),
-    )
+    cancellation_point()
+    thread_id = _activity_thread_id(config)
+    notify_activity(agent_config.activity_sink, "model_started", thread_id)
+    try:
+        answer = model.bind_tools(agent_config.registry.model_schemas()).invoke(
+            messages,
+            config=config,
+            **agent_config.model_profile.output_budget_kwargs(budget),
+        )
+    finally:
+        cancellation_point()
     duration_ms = max(
         0,
         int((time.perf_counter() - started_at) * 1_000),
     )
-    return _model_answer_patch(
+    patch = _model_answer_patch(
         state,
         agent_config=agent_config,
         answer=answer,
@@ -421,6 +457,8 @@ def _call_model(
         output_state=output_state,
         phase=phase,
     )
+    notify_activity(agent_config.activity_sink, "model_completed", thread_id)
+    return patch
 
 
 async def _acall_model(
@@ -430,23 +468,30 @@ async def _acall_model(
     agent_config: EpiAgentRuntimeConfig,
     model: Any,
 ) -> dict[str, Any]:
+    cancellation_point()
     prepared = _prepare_model_request(state, agent_config=agent_config)
     if isinstance(prepared, dict):
         return prepared
     iteration_count, output_state, phase, messages, budget = prepared
     started_at = time.perf_counter()
-    answer = await model.bind_tools(
-        agent_config.registry.model_schemas()
-    ).ainvoke(
-        messages,
-        config=config,
-        **agent_config.model_profile.output_budget_kwargs(budget),
-    )
+    cancellation_point()
+    thread_id = _activity_thread_id(config)
+    notify_activity(agent_config.activity_sink, "model_started", thread_id)
+    try:
+        answer = await model.bind_tools(
+            agent_config.registry.model_schemas()
+        ).ainvoke(
+            messages,
+            config=config,
+            **agent_config.model_profile.output_budget_kwargs(budget),
+        )
+    finally:
+        cancellation_point()
     duration_ms = max(
         0,
         int((time.perf_counter() - started_at) * 1_000),
     )
-    return _model_answer_patch(
+    patch = _model_answer_patch(
         state,
         agent_config=agent_config,
         answer=answer,
@@ -455,6 +500,8 @@ async def _acall_model(
         output_state=output_state,
         phase=phase,
     )
+    notify_activity(agent_config.activity_sink, "model_completed", thread_id)
+    return patch
 
 
 def _model_answer_patch(
@@ -715,6 +762,7 @@ def _model_output_gate(
     *,
     agent_config: EpiAgentRuntimeConfig,
 ) -> dict[str, Any]:
+    cancellation_point()
     profile = agent_config.model_profile
     incremental_cost = profile.incremental_output_cost_display
     if incremental_cost is None:
@@ -727,27 +775,29 @@ def _model_output_gate(
         cost_sentence = (
             "Continuing with another "
             f"{profile.user_output_token_increment:,} tokens may cost "
-            "up to an additional "
-            f"{incremental_cost} in output charges."
+            f"up to an additional {incremental_cost} in output charges."
         )
-    decision = interrupt(
-        {
-            "type": "model_output_limit",
-            "model_id": profile.model_id,
-            "model_label": profile.label,
-            "automatic_token_ceiling": (
-                profile.automatic_output_token_ceiling
-            ),
-            "continuation_tokens": profile.user_output_token_increment,
-            "additional_output_cost": incremental_cost or "unknown",
-            "message": (
-                f"{profile.label} reached its "
-                f"{profile.automatic_output_token_ceiling:,}-token turn "
-                f"limit. {cost_sentence}"
-            ),
-            "actions": ["continue", "cancel"],
-        }
-    )
+    try:
+        decision = interrupt(
+            {
+                "type": "model_output_limit",
+                "model_id": profile.model_id,
+                "model_label": profile.label,
+                "automatic_token_ceiling": (
+                    profile.automatic_output_token_ceiling
+                ),
+                "continuation_tokens": profile.user_output_token_increment,
+                "additional_output_cost": incremental_cost or "unknown",
+                "message": (
+                    f"{profile.label} reached its "
+                    f"{profile.automatic_output_token_ceiling:,}-token turn "
+                    f"limit. {cost_sentence}"
+                ),
+                "actions": ["continue", "cancel"],
+            }
+        )
+    finally:
+        cancellation_point()
     output_state = dict(state.get("model_output_state") or {})
     if decision == {"action": "cancel"}:
         output_state.update(
@@ -832,6 +882,7 @@ def _execute_tools(
     agent_config: EpiAgentRuntimeConfig,
 ) -> dict[str, Any]:
     calls = list(list(state.get("messages") or [])[-1].tool_calls)
+    thread_id = _activity_thread_id(config)
     artifact_store = StateArtifactStore.from_state(state)
     context = agent_config.context_factory(state, config, artifact_store)
     failures = list(state.get("failure_signatures") or [])
@@ -876,9 +927,11 @@ def _execute_tools(
     terminal_error: dict[str, Any] | None = None
     clarification_exchanges: list[dict[str, str]] = []
     tool_state_patch: dict[str, Any] = {}
-    for call in calls:
+    for call_index, call in enumerate(calls):
+        cancellation_point()
         name = call["name"]
         arguments = call["args"]
+        activity_started = False
         if (
             name == _SQL_REPAIR_TOOL_NAME
             and _sql_repair_budget_exhausted(failures)
@@ -897,19 +950,30 @@ def _execute_tools(
                     "executed": False,
                 },
             )
-            messages.append(
-                ToolMessage(
-                    content=_tool_error_content(error),
-                    tool_call_id=call["id"],
-                    name=name,
-                    status="error",
-                )
-            )
+            messages.append(error_tool_message(call, error))
+            messages.extend(aborted_tool_messages(calls[call_index + 1 :]))
             terminal_error = _terminal_error(error.code, str(error))
             break
         try:
-            result = agent_config.registry.invoke(name, arguments, context=context)
-        except GraphInterrupt:
+            cancellation_point()
+            agent_config.registry.spec(name)
+            activity_started = True
+            notify_activity(
+                agent_config.activity_sink,
+                "tool_started",
+                thread_id,
+                call["id"],
+                name,
+            )
+            try:
+                result = agent_config.registry.invoke(
+                    name,
+                    arguments,
+                    context=context,
+                )
+            finally:
+                cancellation_point()
+        except (GraphInterrupt, RunCancelled):
             raise
         except ToolExecutionError as error:
             if (
@@ -935,20 +999,45 @@ def _execute_tools(
                     recoverable=error.recoverable,
                     details=details,
                 )
-            messages.append(
-                ToolMessage(
-                    content=_tool_error_content(error),
-                    tool_call_id=call["id"],
-                    name=name,
-                    status="error",
-                )
-            )
+            messages.append(error_tool_message(call, error))
             failures.append(_failure_signature(error.code, name, arguments))
             if not error.recoverable:
+                messages.extend(
+                    aborted_tool_messages(calls[call_index + 1 :])
+                )
                 terminal_error = _terminal_error(error.code, str(error))
                 break
+            if activity_started:
+                notify_activity(
+                    agent_config.activity_sink,
+                    "tool_recoverable_failure",
+                    thread_id,
+                    call["id"],
+                )
             continue
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected registered tool failure",
+                extra={
+                    "tool_name": name,
+                    "tool_call_id": str(call["id"]),
+                    "thread_id": thread_id,
+                },
+            )
+            error = internal_tool_error()
+            messages.append(error_tool_message(call, error))
+            messages.extend(aborted_tool_messages(calls[call_index + 1 :]))
+            failures.append(_failure_signature(error.code, name, arguments))
+            terminal_error = _terminal_error(error.code, str(error))
+            break
 
+        notify_activity(
+            agent_config.activity_sink,
+            "tool_completed",
+            thread_id,
+            call["id"],
+            name,
+        )
         failures = (
             []
             if name == _SQL_REPAIR_TOOL_NAME
@@ -1078,11 +1167,6 @@ def _execute_tools(
         patch.update(
             {
                 "terminal_control": terminal_control,
-                "agent_status": {
-                    "status": terminal_control["status"],
-                    "run_status": terminal_control["status"],
-                    "terminal_control": terminal_control,
-                },
             }
         )
     if terminal_error is not None:
@@ -1090,11 +1174,6 @@ def _execute_tools(
             {
                 "terminal_error": terminal_error,
                 "completion_blocked": False,
-                "agent_status": {
-                    "status": "error",
-                    "run_status": "error",
-                    "terminal_error": terminal_error,
-                },
             }
         )
     return patch
@@ -1373,20 +1452,10 @@ def build_epi_agent_graph(
     )
 
 
-def invoke_epi_agent(
-    *, graph: CompiledStateGraph, child_state: dict[str, Any], config: RunnableConfig
-) -> dict[str, Any]:
-    graph_config = dict(getattr(graph, "config", None) or {})
-    required = int(graph_config.get("recursion_limit") or 0)
-    if required > int(config.get("recursion_limit") or 0):
-        config = {**config, "recursion_limit": required}
-    return graph.invoke(child_state, config)
-
-
 __all__ = [
+    "ContextPromptError",
     "EpiAgentRuntimeConfig",
     "GenericEpiAgentState",
     "analysis_completion_issues",
     "build_epi_agent_graph",
-    "invoke_epi_agent",
 ]

@@ -10,6 +10,7 @@ from typing import Any, Callable
 import duckdb
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     ValidationError,
     field_validator,
@@ -20,6 +21,9 @@ from db_rag.filter_references import (
     FilterReferenceResolutionError,
     resolve_filter_references,
 )
+from db_rag.catalog import SemanticCatalogUnavailableError
+from db_rag.config import EMBEDDING_MODEL
+from db_rag.retrieval_status import RetrievalOutcome, hybrid_status
 from db_rag.service.dataset_naming import deterministic_dataset_name
 from db_rag.service.models import (
     PreparedSqlCandidate,
@@ -30,8 +34,13 @@ from db_rag.service.sql_service import (
     execute_validated_extraction_sql,
     validate_extraction_sql,
 )
-from epi_agent.artifacts import DatasetPlan, PlanField
+from epi_agent.artifacts import (
+    DatasetPlan,
+    PlanField,
+    dataset_plan_from_artifact,
+)
 from epi_agent.db_rag import persistence as db_rag_persistence
+from epi_agent.db_rag.references import FieldRef, TableRef
 from epi_agent.db_rag.sql_compiler import compile_dataset_plan_sql
 from epi_agent.db_rag.quality import inspect_dataset as inspect_dataset_artifact
 from epi_agent.db_rag.reviews import (
@@ -64,8 +73,8 @@ from utils.dataset_artifacts import (
 
 _MAX_SEARCH_HITS = 10
 _MAX_CATALOG_QUERIES = 5
-_MAX_CATALOG_HITS = 25
 _MAX_TABLE_FIELDS = 25
+_MAX_MODEL_CATALOG_TEXT_CHARS = 80
 _MAX_EXCERPT_CHARS = 500
 _MAX_OPEN_CHARS = 4_000
 _DBRAG_TOOL_PREFIX = "dbrag-"
@@ -94,6 +103,9 @@ class OpenArtifactArguments(BaseModel):
 
 
 class CatalogSearchArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    study_id: str = Field(min_length=1, max_length=512)
     queries: list[str] = Field(
         min_length=1,
         max_length=_MAX_CATALOG_QUERIES,
@@ -119,24 +131,17 @@ class CatalogSearchArguments(BaseModel):
 
 
 class InspectTableArguments(BaseModel):
-    source: str = Field(
-        description="Exact runtime source ID returned by dbrag-search_catalog."
-    )
-    table: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    table_ref: TableRef
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=_MAX_TABLE_FIELDS, ge=1, le=_MAX_TABLE_FIELDS)
 
 
-class RequiredFieldArguments(BaseModel):
-    source: str = Field(
-        description="Exact runtime source ID returned by dbrag-search_catalog."
-    )
-    table: str
-    column: str
-
-
 class FindJoinPathsArguments(BaseModel):
-    required_fields: list[RequiredFieldArguments] = Field(min_length=2)
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    required_fields: list[FieldRef] = Field(min_length=2)
     max_hops: int = Field(default=3, ge=1, le=5)
     max_paths: int = Field(default=10, ge=1, le=20)
 
@@ -147,11 +152,10 @@ class RelationshipKeyPairArguments(BaseModel):
 
 
 class ProfileRelationshipArguments(BaseModel):
-    source: str = Field(
-        description="Exact runtime source ID returned by dbrag-search_catalog."
-    )
-    left_table: str
-    right_table: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    left_table_ref: TableRef
+    right_table_ref: TableRef
     key_pairs: list[RelationshipKeyPairArguments] = Field(min_length=1)
 
 
@@ -225,6 +229,16 @@ def _store(context: ToolContext) -> ArtifactStore:
     return store
 
 
+def _dataset_root(context: ToolContext):
+    if context.thread_storage is None:
+        raise ToolExecutionError(
+            "THREAD_STORAGE_UNAVAILABLE",
+            "Internal configuration error: authorized thread storage is required for dataset persistence.",
+            recoverable=False,
+        )
+    return context.thread_storage
+
+
 def _save_observation(
     context: ToolContext,
     *,
@@ -232,12 +246,13 @@ def _save_observation(
     content: dict[str, Any],
     producer: str,
     summary: str,
+    study_id: str,
 ) -> ArtifactRef:
     return _store(context).save_artifact(
         kind=kind,
         content=content,
         provenance={
-            "study_id": require_context_study(context).study_id,
+            "study_id": study_id,
             "thread_id": context.thread_id,
             "producer": producer,
         },
@@ -293,6 +308,16 @@ def _schema_evidence_hit(value: Any) -> dict[str, Any]:
         _bounded_text(_provider_field(value, "source"), limit=300)
         or _bounded_text(provenance.get("source_id"), limit=300)
     )
+    raw_matched_by = _provider_field(value, "matched_by")
+    matched_by = [
+        mode
+        for mode in (
+            list(raw_matched_by)
+            if isinstance(raw_matched_by, (list, tuple))
+            else []
+        )[:2]
+        if mode in {"vector", "lexical"}
+    ]
     return {
         **({"source": source} if source else {}),
         "table": table,
@@ -303,6 +328,7 @@ def _schema_evidence_hit(value: Any) -> dict[str, Any]:
             or "schema"
         ),
         "provenance": provenance,
+        **({"matched_by": matched_by} if matched_by else {}),
     }
 
 
@@ -385,6 +411,11 @@ def _safe_field(value: Any) -> dict[str, Any]:
     provenance = _safe_schema_provenance(value.get("provenance"))
     if provenance:
         field["provenance"] = provenance
+    matched_by = _safe_string_list(value.get("matched_by"), limit=2)
+    if matched_by:
+        field["matched_by"] = [
+            mode for mode in matched_by if mode in {"vector", "lexical"}
+        ]
     return field
 
 
@@ -404,6 +435,42 @@ def _safe_key_pairs(value: Any) -> list[list[str]]:
         if left and right:
             pairs.append([left, right])
     return pairs
+
+
+def _safe_relationship_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    required = {
+        key: _bounded_text(value.get(key), limit=300)
+        for key in (
+            "left_column",
+            "right_column",
+            "left_join_key",
+            "right_join_key",
+        )
+    }
+    if not all(required.values()):
+        return {}
+    source = _bounded_text(value.get("source"), limit=100)
+    if source not in {"shared_join_key", "declared_relationship"}:
+        return {}
+    result: dict[str, Any] = {**required, "source": source}
+    for key in ("relationship_id", "note"):
+        text = _bounded_text(value.get(key), limit=500)
+        if text:
+            result[key] = text
+    expected = _bounded_text(value.get("expected_cardinality"), limit=100)
+    if expected in {
+        "one_to_one",
+        "one_to_many",
+        "many_to_one",
+        "many_to_many",
+    }:
+        result["expected_cardinality"] = expected
+    direction = _bounded_text(value.get("direction"), limit=100)
+    if direction in {"forward", "reverse"}:
+        result["direction"] = direction
+    return result
 
 
 def _safe_relationship_profile(value: Any) -> dict[str, Any]:
@@ -426,6 +493,14 @@ def _safe_relationship_profile(value: Any) -> dict[str, Any]:
         _collection(value, "warnings"),
         limit=20,
     )
+    profile["relationship_evidence"] = [
+        evidence
+        for evidence in (
+            _safe_relationship_evidence(item)
+            for item in _collection(value, "relationship_evidence")[:20]
+        )
+        if evidence
+    ]
     return profile
 
 
@@ -531,98 +606,188 @@ def _render_evidence(content: dict[str, Any]) -> dict[str, Any]:
     return rendered
 
 
-def _render_catalog(content: dict[str, Any]) -> dict[str, Any]:
-    collection_key = "hits" if "hits" in content else "fields"
-    item_limit = (
-        _MAX_CATALOG_HITS
-        if collection_key == "hits"
-        else _MAX_TABLE_FIELDS
-    )
-    hits = [
+def _compact_catalog_hit(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    hit = {
+        "text": _bounded_text(
+            value.get("text"),
+            limit=_MAX_MODEL_CATALOG_TEXT_CHARS,
+        )
+    }
+    matched_by = _safe_string_list(value.get("matched_by"), limit=2)
+    if matched_by:
+        hit["matched_by"] = [
+            mode for mode in matched_by if mode in {"vector", "lexical"}
+        ]
+    for key, model in (("table_ref", TableRef), ("field_ref", FieldRef)):
+        try:
+            reference = model.model_validate(value.get(key))
+        except ValidationError:
+            continue
+        hit[key] = reference.model_dump(mode="json")
+    if "table_ref" not in hit and "field_ref" not in hit:
+        hit.update(
+            {
+                key: _bounded_text(value.get(key), limit=300)
+                for key in ("source", "table", "column")
+                if value.get(key) is not None
+            }
+        )
+    return hit
+
+
+def _render_catalog_search(content: dict[str, Any]) -> dict[str, Any]:
+    probes: list[dict[str, Any]] = []
+    for value in _collection(content, "probes")[:_MAX_CATALOG_QUERIES]:
+        if not isinstance(value, dict):
+            continue
+        hits = [
+            hit
+            for hit in (
+                _compact_catalog_hit(item)
+                for item in _collection(value, "hits")[:_MAX_SEARCH_HITS]
+            )
+            if hit
+        ]
+        probe: dict[str, Any] = {
+            "query": _bounded_text(value.get("query"), limit=500),
+            "returned_count": len(hits),
+            "hits": hits,
+        }
+        for key in (
+            "table_hits",
+            "column_hits",
+            "unique_table_count",
+            "unique_column_count",
+        ):
+            count = value.get(key)
+            probe[key] = (
+                max(0, count)
+                if isinstance(count, int) and not isinstance(count, bool)
+                else 0
+            )
+        probes.append(probe)
+
+    summary = content.get("retrieval_summary")
+    safe_summary: dict[str, Any] = {}
+    if isinstance(summary, dict):
+        for key in (
+            "probe_count",
+            "unique_table_count",
+            "unique_column_count",
+            "vector_hits",
+            "lexical_hits",
+        ):
+            count = summary.get(key)
+            safe_summary[key] = (
+                max(0, count)
+                if isinstance(count, int) and not isinstance(count, bool)
+                else 0
+            )
+
+    embedding = content.get("embedding")
+    safe_embedding = {
+        key: (
+            value
+            if key == "available" and isinstance(value, bool)
+            else _bounded_text(value, limit=500)
+        )
+        for key, value in dict(embedding or {}).items()
+        if key in {"available", "model", "reason_code", "message"}
+    }
+    return {
+        "study_id": _bounded_text(content.get("study_id"), limit=300),
+        "retrieval_mode": _bounded_text(
+            content.get("retrieval_mode"),
+            limit=100,
+        ),
+        "embedding": safe_embedding,
+        "source_ids": _safe_string_list(
+            _collection(content, "source_ids"),
+            limit=50,
+        ),
+        "retrieval_summary": safe_summary,
+        "probes": probes,
+    }
+
+
+def _compact_inspection_field(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: _bounded_text(value.get(key), limit=300)
+        for key in ("column", "text", "source_kind")
+        if value.get(key) is not None
+    }
+    try:
+        field_ref = FieldRef.model_validate(value.get("field_ref"))
+    except ValidationError:
+        return result
+    result["field_ref"] = field_ref.model_dump(mode="json")
+    return result
+
+
+def _render_table_profile(content: dict[str, Any]) -> dict[str, Any]:
+    fields = [
         field
         for field in (
-            _safe_field(item)
-            for item in _collection(content, collection_key)
+            _compact_inspection_field(item)
+            for item in _collection(content, "fields")
         )
         if field
-    ][:item_limit]
-    rendered = {
-        key: value
-        for key, value in {
-            "query": _bounded_text(content.get("query")),
-            "queries": _safe_string_list(
-                _collection(content, "queries"),
-                limit=_MAX_CATALOG_QUERIES,
-            ),
-            "source": _bounded_text(content.get("source")),
-            "source_ids": _safe_string_list(
-                _collection(content, "source_ids"),
-                limit=50,
-            ),
-            "table": _bounded_text(content.get("table")),
-            "offset": content.get("offset"),
-            "next_offset": content.get("next_offset"),
-            collection_key: hits,
-        }.items()
-        if value not in ("", [], None)
+    ][:_MAX_TABLE_FIELDS]
+    offset = content.get("offset")
+    next_offset = content.get("next_offset")
+    rendered: dict[str, Any] = {
+        "offset": (
+            max(0, offset)
+            if isinstance(offset, int) and not isinstance(offset, bool)
+            else 0
+        ),
+        "returned_count": len(fields),
+        "has_more": bool(content.get("has_more")),
+        "next_offset": (
+            next_offset
+            if isinstance(next_offset, int) and not isinstance(next_offset, bool)
+            else None
+        ),
+        "fields": fields,
     }
-    summary = content.get("retrieval_summary")
-    if isinstance(summary, dict):
-        probes: list[dict[str, Any]] = []
-        for value in summary.get("probes") or []:
-            if not isinstance(value, dict):
-                continue
-            probe: dict[str, Any] = {
-                "query": _bounded_text(value.get("query"), limit=500),
-            }
-            for key in (
-                "table_hits",
-                "column_hits",
-                "unique_table_count",
-                "unique_column_count",
-            ):
-                count = value.get(key)
-                if isinstance(count, int) and not isinstance(count, bool):
-                    probe[key] = max(0, count)
-            probes.append(probe)
-        safe_summary: dict[str, Any] = {
-            "probe_count": (
-                summary.get("probe_count")
-                if isinstance(summary.get("probe_count"), int)
-                and not isinstance(summary.get("probe_count"), bool)
-                else len(probes)
-            ),
-            "unique_table_count": (
-                summary.get("unique_table_count")
-                if isinstance(summary.get("unique_table_count"), int)
-                and not isinstance(summary.get("unique_table_count"), bool)
-                else 0
-            ),
-            "unique_column_count": (
-                summary.get("unique_column_count")
-                if isinstance(summary.get("unique_column_count"), int)
-                and not isinstance(summary.get("unique_column_count"), bool)
-                else 0
-            ),
-            "probes": probes[:_MAX_CATALOG_QUERIES],
-        }
-        rendered["retrieval_summary"] = safe_summary
+    try:
+        table_ref = TableRef.model_validate(content.get("table_ref"))
+    except ValidationError:
+        rendered["source"] = _bounded_text(content.get("source"), limit=300)
+        rendered["table"] = _bounded_text(content.get("table"), limit=300)
+    else:
+        rendered["table_ref"] = table_ref.model_dump(mode="json")
     return rendered
 
 
 def _render_relationship(content: dict[str, Any]) -> dict[str, Any]:
-    rendered: dict[str, Any] = {"source": _bounded_text(content.get("source"))}
+    rendered: dict[str, Any] = {
+        "study_id": _bounded_text(content.get("study_id")),
+        "source": _bounded_text(content.get("source")),
+    }
+    for key in ("left_table_ref", "right_table_ref"):
+        try:
+            table_ref = TableRef.model_validate(content.get(key))
+        except ValidationError:
+            continue
+        rendered[key] = table_ref.model_dump(mode="json")
     profile = _safe_relationship_profile(content.get("profile"))
     if profile:
         rendered["profile"] = profile
-    required_fields = [
-        field
-        for field in (
-            _safe_field(item)
-            for item in _collection(content, "required_fields")
-        )
-        if field
-    ]
+    required_fields: list[dict[str, Any]] = []
+    for item in _collection(content, "required_fields"):
+        try:
+            field_ref = FieldRef.model_validate(item)
+        except ValidationError:
+            field = _safe_field(item)
+            if field:
+                required_fields.append(field)
+        else:
+            required_fields.append(field_ref.model_dump(mode="json"))
     if required_fields:
         rendered["required_fields"] = required_fields[:50]
     paths: list[dict[str, Any]] = []
@@ -797,7 +962,7 @@ def _render_dataset(content: dict[str, Any]) -> dict[str, Any]:
 
 
 _ARTIFACT_RENDERERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
-    "catalog_search": _render_catalog,
+    "catalog_search": _render_catalog_search,
     "dataset_plan": _render_dataset_plan,
     "dataset_quality_report": _render_quality,
     "db_rag_column_selection": _render_selection,
@@ -806,7 +971,7 @@ _ARTIFACT_RENDERERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "relationship_profile": _render_relationship,
     "study_evidence": _render_evidence,
     "study_source": _render_evidence,
-    "table_profile": _render_catalog,
+    "table_profile": _render_table_profile,
 }
 
 
@@ -862,24 +1027,59 @@ def _require_artifact(
     return artifact
 
 
-def _require_source(context: ToolContext, source_name: str) -> Any:
+def _require_source_for_study(study: Any, source_id: str) -> Any:
     try:
-        return require_context_study(context).data_sources[source_name]
+        return study.data_sources[source_id]
     except KeyError as error:
         raise ToolExecutionError(
             "SOURCE_UNAVAILABLE",
-            f"Runtime source is unavailable: {source_name}",
+            (
+                f"Runtime source {source_id} is unavailable in study "
+                f"{study.study_id}."
+            ),
             recoverable=True,
+            details={
+                "study_id": study.study_id,
+                "source_id": source_id,
+            },
         ) from error
 
 
-def _relationship_inventory(context: ToolContext, source_name: str) -> Any:
-    source = _require_source(context, source_name)
+def _resolve_table_ref(
+    context: ToolContext,
+    value: dict[str, Any] | TableRef,
+) -> tuple[TableRef, Any, Any]:
+    reference = TableRef.model_validate(value)
+    study = require_context_study(context, reference.study_id)
+    source = _require_source_for_study(study, reference.source_id)
+    return reference, study, source
+
+
+def _catalog_field_exists_for_study(
+    study: Any,
+    table: str,
+    column: str,
+) -> bool:
+    field_exists = getattr(study.catalog, "field_exists", None)
+    if not callable(field_exists):
+        raise ToolExecutionError(
+            "CATALOG_UNAVAILABLE",
+            (
+                f"Study {study.study_id} does not provide runtime field "
+                "validation."
+            ),
+            recoverable=True,
+        )
+    return bool(field_exists(table, column))
+
+
+def _relationship_inventory_for_study(study: Any, source_id: str) -> Any:
+    source = _require_source_for_study(study, source_id)
     factory = getattr(source, "relationship_inventory", None)
     if not callable(factory):
         raise ToolExecutionError(
             "RELATIONSHIP_PROVIDER_UNAVAILABLE",
-            f"Source does not provide relationship inspection: {source_name}",
+            f"Source does not provide relationship inspection: {source_id}",
             recoverable=True,
         )
     try:
@@ -887,13 +1087,13 @@ def _relationship_inventory(context: ToolContext, source_name: str) -> Any:
     except StudySourceUnavailableError as error:
         raise ToolExecutionError(
             "RELATIONSHIP_PROVIDER_UNAVAILABLE",
-            f"Relationship provider is unavailable for source {source_name}.",
+            f"Relationship provider is unavailable for source {source_id}.",
             recoverable=True,
         ) from error
     except (KeyError, ValueError) as error:
         raise ToolExecutionError(
             "RELATIONSHIP_UNAVAILABLE",
-            f"Relationship inventory is unavailable for source {source_name}.",
+            f"Relationship inventory is unavailable for source {source_id}.",
             recoverable=True,
         ) from error
 
@@ -945,38 +1145,44 @@ def _raise_missing_result(code: str, message: str) -> None:
     )
 
 
-def _catalog_field_exists(context: ToolContext, table: str, column: str) -> bool:
-    field_exists = getattr(
-        require_context_study(context).catalog,
-        "field_exists",
-        None,
-    )
-    if not callable(field_exists):
-        raise ToolExecutionError(
-            "CATALOG_UNAVAILABLE",
-            "The active study does not provide runtime field validation.",
-            recoverable=True,
-        )
-    return bool(field_exists(table, column))
-
-
 def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
     limit = min(int(arguments["limit"]), _MAX_SEARCH_HITS)
     queries = list(arguments["queries"])
-    study = require_context_study(context)
+    study = require_context_study(context, arguments["study_id"])
     search_many = getattr(study.catalog, "search_many", None)
+    search_many_with_status = getattr(
+        study.catalog,
+        "search_many_with_status",
+        None,
+    )
     if not callable(search_many):
         raise ToolExecutionError(
             "CATALOG_UNAVAILABLE",
-            "The active study does not provide batched catalog search.",
+            "The requested study does not provide batched catalog search.",
             recoverable=True,
         )
     source_ids = sorted(str(source_id) for source_id in study.data_sources)
-    hits: list[dict[str, Any]] = []
+    all_hits: list[dict[str, Any]] = []
     all_tables: set[tuple[str, str]] = set()
     all_columns: set[tuple[str, str, str]] = set()
-    probe_summaries: list[dict[str, Any]] = []
-    provider_batches = search_many(queries, limit=limit)
+    probe_results: list[dict[str, Any]] = []
+    try:
+        if callable(search_many_with_status):
+            outcome = search_many_with_status(queries, limit=limit)
+        else:
+            outcome = RetrievalOutcome(
+                value=search_many(queries, limit=limit),
+                status=hybrid_status(
+                    getattr(study.catalog, "embedding_model", EMBEDDING_MODEL)
+                ),
+            )
+    except SemanticCatalogUnavailableError as error:
+        raise ToolExecutionError(
+            "SEMANTIC_CATALOG_UNAVAILABLE",
+            str(error),
+            recoverable=True,
+        ) from error
+    provider_batches = outcome.value
     if len(provider_batches) != len(queries):
         raise ToolExecutionError(
             "CATALOG_RESPONSE_INVALID",
@@ -985,7 +1191,7 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
         )
     for query, provider_hits in zip(queries, provider_batches):
         normalized_hits: list[dict[str, Any]] = []
-        for provider_hit in provider_hits:
+        for provider_hit in provider_hits[:limit]:
             hit = _schema_evidence_hit(provider_hit)
             source = str(hit.get("source") or "").strip()
             if not source and len(source_ids) == 1:
@@ -1002,9 +1208,21 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
                     **dict(hit.get("provenance") or {}),
                     "source_id": source,
                 }
+                table_ref = {
+                    "study_id": study.study_id,
+                    "source_id": source,
+                    "table": str(hit.get("table") or ""),
+                }
+                if hit.get("column"):
+                    hit["field_ref"] = {
+                        **table_ref,
+                        "column": str(hit["column"]),
+                    }
+                else:
+                    hit["table_ref"] = table_ref
             hit["retrieval_probe"] = query
             normalized_hits.append(hit)
-            hits.append(hit)
+            all_hits.append(hit)
         probe_tables = {
             (str(hit.get("source") or ""), str(hit.get("table") or ""))
             for hit in normalized_hits
@@ -1021,9 +1239,10 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
         }
         all_tables.update(probe_tables)
         all_columns.update(probe_columns)
-        probe_summaries.append(
+        probe_results.append(
             {
                 "query": query,
+                "returned_count": len(normalized_hits),
                 "table_hits": sum(
                     1 for hit in normalized_hits if not hit.get("column")
                 ),
@@ -1032,18 +1251,27 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
                 ),
                 "unique_table_count": len(probe_tables),
                 "unique_column_count": len(probe_columns),
+                "hits": normalized_hits,
             }
         )
     content = {
+        "study_id": study.study_id,
         "queries": queries,
         "source_ids": source_ids,
+        "retrieval_mode": outcome.status.mode,
+        "embedding": outcome.status.as_dict(),
         "retrieval_summary": {
             "probe_count": len(queries),
             "unique_table_count": len(all_tables),
             "unique_column_count": len(all_columns),
-            "probes": probe_summaries,
+            "vector_hits": sum(
+                "vector" in hit.get("matched_by", []) for hit in all_hits
+            ),
+            "lexical_hits": sum(
+                "lexical" in hit.get("matched_by", []) for hit in all_hits
+            ),
         },
-        "hits": hits[:_MAX_CATALOG_HITS],
+        "probes": probe_results,
     }
     reference = _save_observation(
         context,
@@ -1051,59 +1279,73 @@ def _search_catalog(arguments: dict[str, Any], context: ToolContext) -> ToolResu
         content=content,
         producer="dbrag-search_catalog",
         summary=(
-            f"{len(content['hits'])} schema catalog hits for "
+            f"{sum(probe['returned_count'] for probe in probe_results)} "
+            "schema catalog hits for "
             f"{len(queries)} probes"
         ),
+        study_id=study.study_id,
     )
     return ToolResult(
-        message=json.dumps(_render_catalog(content), sort_keys=True),
+        message=json.dumps(
+            _render_catalog_search(content),
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         artifacts=(reference,),
     )
 
 
 def _inspect_table(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-    _require_source(context, arguments["source"])
-    inspect_table = getattr(
-        require_context_study(context).catalog,
-        "inspect_table",
-        None,
+    table_ref, study, _source = _resolve_table_ref(
+        context,
+        arguments["table_ref"],
     )
+    inspect_table = getattr(study.catalog, "inspect_table", None)
     if not callable(inspect_table):
         raise ToolExecutionError(
             "CATALOG_UNAVAILABLE",
-            "The active study does not provide exact table inspection.",
+            "The requested study does not provide exact table inspection.",
             recoverable=True,
         )
     offset = int(arguments["offset"])
     limit = int(arguments["limit"])
     provider_fields = inspect_table(
-        arguments["source"],
-        arguments["table"],
+        table_ref.source_id,
+        table_ref.table,
         offset=offset,
         limit=limit + 1,
     )
     fields = []
     for provider_hit in provider_fields[:limit]:
         hit = _schema_evidence_hit(provider_hit)
-        if hit.get("source") != arguments["source"]:
+        if (
+            hit.get("source") != table_ref.source_id
+            or hit.get("table") != table_ref.table
+        ):
             raise ToolExecutionError(
-                "CATALOG_SOURCE_MISMATCH",
-                "Exact table evidence does not match the requested runtime source.",
+                "STUDY_REFERENCE_MISMATCH",
+                "Exact table evidence does not match the requested table reference.",
                 recoverable=True,
             )
+        hit["field_ref"] = {
+            **table_ref.model_dump(mode="json"),
+            "column": str(hit.get("column") or ""),
+        }
         fields.append(hit)
     if not fields:
         _raise_missing_result(
             "TABLE_NOT_FOUND",
-            f"Runtime table is unavailable: {arguments['table']}",
+            f"Runtime table is unavailable: {table_ref.table}",
         )
+    has_more = len(provider_fields) > limit
     content = {
-        "source": arguments["source"],
-        "table": arguments["table"],
+        "table_ref": table_ref.model_dump(mode="json"),
         "offset": offset,
+        "returned_count": len(fields),
+        "has_more": has_more,
         "next_offset": (
             offset + limit
-            if len(provider_fields) > limit
+            if has_more
             else None
         ),
         "fields": fields,
@@ -1113,35 +1355,56 @@ def _inspect_table(arguments: dict[str, Any], context: ToolContext) -> ToolResul
         kind="table_profile",
         content=content,
         producer="dbrag-inspect_table",
-        summary=f"Bounded schema profile for {arguments['table']}",
+        summary=f"Bounded schema profile for {table_ref.table}",
+        study_id=study.study_id,
     )
     return ToolResult(
-        message=json.dumps(_render_catalog(content), sort_keys=True),
+        message=json.dumps(
+            _render_table_profile(content),
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         artifacts=(reference,),
     )
 
 
 def _find_join_paths(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-    required_fields = arguments["required_fields"]
-    sources = {field["source"] for field in required_fields}
+    required_fields = [
+        FieldRef.model_validate(field)
+        for field in arguments["required_fields"]
+    ]
+    study_ids = {field.study_id for field in required_fields}
+    if len(study_ids) != 1:
+        raise ToolExecutionError(
+            "CROSS_STUDY_OPERATION_UNAVAILABLE",
+            "Join-path discovery cannot combine fields from different studies.",
+            recoverable=True,
+        )
+    source_ids = {field.source_id for field in required_fields}
+    sources = source_ids
     if len(sources) != 1:
         raise ToolExecutionError(
             "CROSS_SOURCE_RELATIONSHIP_UNAVAILABLE",
             "Join-path discovery requires fields from one runtime source.",
             recoverable=True,
         )
-    source_name = next(iter(sources))
-    _require_source(context, source_name)
+    study = require_context_study(context, next(iter(study_ids)))
+    source_name = next(iter(source_ids))
+    _require_source_for_study(study, source_name)
     for field in required_fields:
-        if not _catalog_field_exists(context, field["table"], field["column"]):
+        if not _catalog_field_exists_for_study(
+            study,
+            field.table,
+            field.column,
+        ):
             _raise_missing_result(
                 "JOIN_PATH_UNAVAILABLE",
                 (
                     "Join-path field is unavailable: "
-                    f"{field['table']}.{field['column']}"
+                    f"{field.table}.{field.column}"
                 ),
             )
-    tables = list(dict.fromkeys(field["table"] for field in required_fields))
+    tables = list(dict.fromkeys(field.table for field in required_fields))
     if len(tables) < 2:
         raise ToolExecutionError(
             "JOIN_PATH_NOT_REQUIRED",
@@ -1149,7 +1412,7 @@ def _find_join_paths(arguments: dict[str, Any], context: ToolContext) -> ToolRes
             recoverable=True,
         )
 
-    inventory = _relationship_inventory(context, source_name)
+    inventory = _relationship_inventory_for_study(study, source_name)
     paths: list[dict[str, Any]] = []
     for left_index, left_table in enumerate(tables):
         for right_table in tables[left_index + 1 :]:
@@ -1179,19 +1442,24 @@ def _find_join_paths(arguments: dict[str, Any], context: ToolContext) -> ToolRes
             "No observed runtime join path covers the requested fields.",
         )
     content = {
+        "study_id": study.study_id,
         "source": source_name,
-        "required_fields": required_fields,
+        "required_fields": [
+            field.model_dump(mode="json") for field in required_fields
+        ],
         "paths": paths,
     }
+    rendered_content = _render_relationship(content)
     reference = _save_observation(
         context,
         kind="relationship_profile",
-        content=content,
+        content=rendered_content,
         producer="dbrag-find_join_paths",
         summary=f"{len(paths)} observed join paths",
+        study_id=study.study_id,
     )
     return ToolResult(
-        message=json.dumps(_render_relationship(content), sort_keys=True),
+        message=json.dumps(rendered_content, sort_keys=True),
         artifacts=(reference,),
     )
 
@@ -1200,15 +1468,30 @@ def _profile_relationship(
     arguments: dict[str, Any],
     context: ToolContext,
 ) -> ToolResult:
-    inventory = _relationship_inventory(context, arguments["source"])
+    left_ref = TableRef.model_validate(arguments["left_table_ref"])
+    right_ref = TableRef.model_validate(arguments["right_table_ref"])
+    if left_ref.study_id != right_ref.study_id:
+        raise ToolExecutionError(
+            "CROSS_STUDY_OPERATION_UNAVAILABLE",
+            "Relationship profiling cannot combine tables from different studies.",
+            recoverable=True,
+        )
+    if left_ref.source_id != right_ref.source_id:
+        raise ToolExecutionError(
+            "CROSS_SOURCE_RELATIONSHIP_UNAVAILABLE",
+            "Relationship profiling requires tables from one runtime source.",
+            recoverable=True,
+        )
+    study = require_context_study(context, left_ref.study_id)
+    inventory = _relationship_inventory_for_study(study, left_ref.source_id)
     key_pairs = [
         (pair["left_column"], pair["right_column"])
         for pair in arguments["key_pairs"]
     ]
     try:
         profile = inventory.profile_relationship(
-            arguments["left_table"],
-            arguments["right_table"],
+            left_ref.table,
+            right_ref.table,
             key_pairs,
         )
     except (KeyError, ValueError) as error:
@@ -1216,32 +1499,88 @@ def _profile_relationship(
             "RELATIONSHIP_UNAVAILABLE",
             (
                 "The requested runtime relationship could not be profiled "
-                f"between {arguments['left_table']} and {arguments['right_table']}."
+                f"between {left_ref.table} and {right_ref.table}."
             ),
             recoverable=True,
         ) from error
     profile_content = _bounded_model_dump(profile)
-    content = {"source": arguments["source"], "profile": profile_content}
+    content = {
+        "study_id": study.study_id,
+        "source": left_ref.source_id,
+        "left_table_ref": left_ref.model_dump(mode="json"),
+        "right_table_ref": right_ref.model_dump(mode="json"),
+        "profile": profile_content,
+    }
+    rendered_content = _render_relationship(content)
     reference = _save_observation(
         context,
         kind="relationship_profile",
-        content=content,
+        content=rendered_content,
         producer="dbrag-profile_relationship",
         summary=(
-            f"Observed relationship between {arguments['left_table']} "
-            f"and {arguments['right_table']}"
+            f"Observed relationship between {left_ref.table} "
+            f"and {right_ref.table}"
         ),
+        study_id=study.study_id,
     )
     return ToolResult(
-        message=json.dumps(_render_relationship(content), sort_keys=True),
+        message=json.dumps(rendered_content, sort_keys=True),
         artifacts=(reference,),
     )
+
+
+def _require_plan_study(context: ToolContext, plan: DatasetPlan) -> Any:
+    try:
+        return require_context_study(context, plan.study_id)
+    except ToolExecutionError as error:
+        if error.code not in {
+            "STUDY_NOT_AVAILABLE",
+            "NO_STUDY_PACKAGE_INSTALLED",
+        }:
+            raise
+        raise ToolExecutionError(
+            "PLAN_STUDY_UNAVAILABLE",
+            f"Dataset plan study is unavailable: {plan.study_id}",
+            recoverable=True,
+            details={"study_id": plan.study_id},
+        ) from error
 
 
 def _save_dataset_plan(
     arguments: dict[str, Any],
     context: ToolContext,
 ) -> ToolResult:
+    plan = DatasetPlan.model_validate(arguments["plan"])
+    study = _require_plan_study(context, plan)
+    source_ids = set(study.data_sources)
+    for source, table, column in _plan_reference_keys(plan):
+        if source not in source_ids:
+            raise ToolExecutionError(
+                "STUDY_REFERENCE_MISMATCH",
+                (
+                    f"Plan field {source}.{table}.{column} does not belong "
+                    f"to study {plan.study_id}."
+                ),
+                recoverable=True,
+                details={
+                    "study_id": plan.study_id,
+                    "source_id": source,
+                    "table": table,
+                    "column": column,
+                },
+            )
+        if not _catalog_field_exists_for_study(study, table, column):
+            raise ToolExecutionError(
+                "PLAN_FIELD_UNAVAILABLE",
+                f"Plan field is unavailable: {source}.{table}.{column}",
+                recoverable=True,
+                details={
+                    "study_id": plan.study_id,
+                    "source": source,
+                    "table": table,
+                    "column": column,
+                },
+            )
     prior_id = arguments.get("prior_id")
     prior_version = arguments.get("prior_version")
     if (prior_id is None) != (prior_version is None):
@@ -1278,11 +1617,11 @@ def _save_dataset_plan(
             )
     try:
         reference = _store(context).save_dataset_plan(
-            DatasetPlan.model_validate(arguments["plan"]),
+            plan,
             prior_id=prior_id,
             prior_version=prior_version,
             provenance={
-                "study_id": require_context_study(context).study_id,
+                "study_id": study.study_id,
                 "thread_id": context.thread_id,
                 "producer": "dbrag-save_dataset_plan",
             },
@@ -1753,8 +2092,8 @@ def _filter_value_exists(
         )
 
 
-def _source_database_path(context: ToolContext, source_name: str) -> Path:
-    source = _require_source(context, source_name)
+def _source_database_path(study: Any, source_name: str) -> Path:
+    source = _require_source_for_study(study, source_name)
     path = getattr(source, "path", None)
     if path is None:
         raise ToolExecutionError(
@@ -1792,10 +2131,10 @@ def _required_plan_tables(
 
 def _join_profile_edges(
     plan: DatasetPlan,
-    context: ToolContext,
+    study: Any,
     source_name: str,
 ) -> list[dict[str, Any]]:
-    inventory = _relationship_inventory(context, source_name)
+    inventory = _relationship_inventory_for_study(study, source_name)
     profiles: list[Any] = []
     for operation in plan.operations:
         if operation.name.strip().casefold() != "join":
@@ -1854,9 +2193,9 @@ def _join_profile_edges(
 
 def _verified_join_paths(
     plan: DatasetPlan,
-    context: ToolContext,
+    study: Any,
 ) -> list[dict[str, Any]]:
-    source_ids = set(require_context_study(context).data_sources)
+    source_ids = set(study.data_sources)
     constraints, _constraint_issues = _normalized_value_constraints(plan, source_ids)
     required_tables = _required_plan_tables(plan, constraints, source_ids)
     if len(required_tables) != 1:
@@ -1864,7 +2203,7 @@ def _verified_join_paths(
     source_name, tables = next(iter(required_tables.items()))
     if len(tables) < 2:
         return []
-    edges = _join_profile_edges(plan, context, source_name)
+    edges = _join_profile_edges(plan, study, source_name)
     adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = {
         table: [] for table in tables
     }
@@ -1945,8 +2284,17 @@ def _validate_dataset_plan(
         version=reference.version,
         kind=reference.kind,
     )
-    plan = DatasetPlan.model_validate(stored.content)
-    source_ids = set(require_context_study(context).data_sources)
+    try:
+        plan = dataset_plan_from_artifact(stored)
+    except ValueError as error:
+        code = str(error).split(":", 1)[0]
+        raise ToolExecutionError(
+            code,
+            str(error),
+            recoverable=True,
+        ) from error
+    study = _require_plan_study(context, plan)
+    source_ids = set(study.data_sources)
     constraints, issues = _normalized_value_constraints(plan, source_ids)
 
     if not any(concept.fields for concept in plan.concepts):
@@ -1972,7 +2320,11 @@ def _validate_dataset_plan(
             )
             issues.append(_plan_issue(error, path=path))
             continue
-        if not table or not column or not _catalog_field_exists(context, table, column):
+        if not table or not column or not _catalog_field_exists_for_study(
+            study,
+            table,
+            column,
+        ):
             error = ToolExecutionError(
                 "PLAN_FIELD_UNAVAILABLE",
                 f"Runtime field is unavailable: {table}.{column}.",
@@ -1988,7 +2340,7 @@ def _validate_dataset_plan(
         operator = str(constraint.get("operator") or "").strip().casefold()
         path = str(constraint.get("path") or "filters")
         try:
-            database_path = _source_database_path(context, source)
+            database_path = _source_database_path(study, source)
             for value_index, value in enumerate(_filter_constraint_values(constraint)):
                 if not _filter_value_exists(
                     database_path=database_path,
@@ -2041,7 +2393,7 @@ def _validate_dataset_plan(
             source_name, tables = next(iter(required_tables.items()))
             if len(tables) > 1:
                 try:
-                    paths = _verified_join_paths(plan, context)
+                    paths = _verified_join_paths(plan, study)
                 except ToolExecutionError as error:
                     paths = []
                     issues.append(_plan_issue(error, path="operations"))
@@ -2088,7 +2440,16 @@ def _approved_plan(
             ),
             recoverable=True,
         )
-    return stored, DatasetPlan.model_validate(stored.content)
+    try:
+        plan = dataset_plan_from_artifact(stored)
+    except ValueError as error:
+        raise ToolExecutionError(
+            "PLAN_STUDY_LINEAGE_INVALID",
+            str(error),
+            recoverable=True,
+        ) from error
+    _require_plan_study(context, plan)
+    return stored, plan
 
 
 def _plan_columns(plan: DatasetPlan) -> list[dict[str, Any]]:
@@ -2152,7 +2513,8 @@ def _plan_runtime_path(context: ToolContext, plan: DatasetPlan) -> Any:
             "Agent SQL execution currently requires one approved runtime source.",
             recoverable=True,
         )
-    source = _require_source(context, next(iter(sources)))
+    study = _require_plan_study(context, plan)
+    source = _require_source_for_study(study, next(iter(sources)))
     path = getattr(source, "path", None)
     if path is None:
         raise ToolExecutionError(
@@ -2161,41 +2523,6 @@ def _plan_runtime_path(context: ToolContext, plan: DatasetPlan) -> Any:
             recoverable=True,
         )
     return path
-
-
-def _sql_error_code(error: ValueError) -> str:
-    message = str(error).casefold()
-    if (
-        "unapproved operation" in message
-        or "row-shaping" in message
-    ):
-        return "SQL_UNAPPROVED_OPERATION"
-    if (
-        "relation" in message
-        or "external scan" in message
-        or "table function" in message
-    ):
-        return "SQL_UNAPPROVED_RELATION"
-    if (
-        "unapproved output" in message
-        or "unapproved source field" in message
-        or "unapproved column" in message
-        or "unapproved table" in message
-        or "approved source column" in message
-        or "output alias" in message
-        or "projection source" in message
-        or "projection must include" in message
-    ):
-        return "SQL_UNAPPROVED_SCHEMA"
-    if (
-        "row filter" in message
-        or "row predicate" in message
-        or "filter boolean" in message
-    ):
-        return "SQL_UNAPPROVED_FILTER"
-    if "approved plan operation" in message or "approved plan" in message and "join" in message:
-        return "SQL_UNAPPROVED_OPERATION"
-    return "SQL_VALIDATION_FAILED"
 
 
 def _sql_repair_details(
@@ -2248,6 +2575,12 @@ def _validated_sql_artifact(
         None,
     )
     if existing is not None:
+        if existing.provenance.get("study_id") != plan.study_id:
+            raise ToolExecutionError(
+                "STUDY_REFERENCE_MISMATCH",
+                "Validated SQL and its dataset plan identify different studies.",
+                recoverable=False,
+            )
         return existing
 
     row_filters = _plan_row_filters(plan)
@@ -2275,7 +2608,7 @@ def _validated_sql_artifact(
             "applied_filters": [],
         },
         provenance={
-            "study_id": require_context_study(context).study_id,
+            "study_id": plan.study_id,
             "thread_id": context.thread_id,
             "producer": "dbrag-validate_and_extract",
             "plan": {"id": plan_id, "version": plan_version},
@@ -2570,6 +2903,7 @@ def _projected_aliases_are_covered(
 def _dataset_persistence_lineage(
     context: ToolContext,
     *,
+    study_id: str,
     plan_id: str,
     plan_version: int,
     plan_content: dict[str, Any],
@@ -2582,6 +2916,7 @@ def _dataset_persistence_lineage(
     predecessor: tuple[str, int] | None,
 ) -> dict[str, Any]:
     return {
+        "study_id": str(study_id).strip(),
         "thread_id": context.thread_id,
         "plan_id": plan_id,
         "plan_version": plan_version,
@@ -2796,6 +3131,7 @@ def _validate_canonical_dataset_lineage(
 ) -> None:
     provenance = dict(artifact.get("provenance") or {})
     expected = {
+        "study_id": lineage.get("study_id"),
         "thread_id": lineage.get("thread_id"),
         "plan_id": lineage.get("plan_id"),
         "plan_version": lineage.get("plan_version"),
@@ -3420,6 +3756,12 @@ def _persist_extraction_result(
     plan_version = int(arguments["plan_version"])
     predecessor_identity = _predecessor_identity(arguments)
     sql_content = dict(sql_artifact.content)
+    if sql_artifact.provenance.get("study_id") != plan.study_id:
+        raise ToolExecutionError(
+            "STUDY_REFERENCE_MISMATCH",
+            "Validated SQL and its dataset plan identify different studies.",
+            recoverable=False,
+        )
     dataset_id = _deterministic_agent_dataset_id(
         thread_id=context.thread_id,
         plan_id=plan_id,
@@ -3450,6 +3792,7 @@ def _persist_extraction_result(
     methods = _persistence_store_methods(context)
     lineage = _dataset_persistence_lineage(
         context,
+        study_id=plan.study_id,
         plan_id=plan_id,
         plan_version=plan_version,
         plan_content=dict(stored_plan.content),
@@ -3461,15 +3804,13 @@ def _persist_extraction_result(
         approved_selected_columns=approved_selected_columns,
         predecessor=predecessor_identity,
     )
-    runtime_root = db_rag_persistence.DEFAULT_RUNTIME_ROOT
+    runtime_root = _dataset_root(context)
     final_paths = generated_dataset_artifact_paths(
-        runtime_root=runtime_root,
-        thread_id=context.thread_id,
+        dataset_root=context.thread_storage.datasets,
         dataset_id=dataset_id,
     )
     staging_paths = generated_dataset_staging_paths(
-        runtime_root=runtime_root,
-        thread_id=context.thread_id,
+        dataset_root=context.thread_storage.datasets,
         dataset_id=dataset_id,
     )
     expected_final_paths = {
@@ -3663,6 +4004,7 @@ def _persist_extraction_result(
                 candidate,
                 approved_selection,
                 execution,
+                study_id=plan.study_id,
                 selection_artifact_id=plan_id,
                 sql_candidate_artifact_id=sql_artifact.id,
                 plan_id=plan_id,
@@ -3688,6 +4030,7 @@ def _persist_extraction_result(
                 stage_only=True,
                 artifact_version=1,
                 artifact_status="pending_review",
+                runtime_root=runtime_root,
             )
         )
     except FileExistsError as error:

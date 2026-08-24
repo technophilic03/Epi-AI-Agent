@@ -1,9 +1,8 @@
 # Introduction
 
-This is a lightweight local demo of AI Agent focusing on Epidemiological Research. It runs on macOS and Linux
-with Python 3.12 and an OpenAI or Anthropic API key (or a self-hosted
-OpenAI-compatible endpoint such as vLLM).
-[Watch the demo video](https://drive.google.com/file/d/1A-N8pTOn6tKcZ_D6DLPc62EWvb2e_68E/view?usp=sharing)
+This is a lightweight local AI agent demo for epidemiological research. It runs
+on macOS and Linux with Python 3.12 and an OpenAI or Anthropic API key.
+
 ## Start the demo
 
 ```bash
@@ -19,54 +18,36 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 
 cp .env.example .env
-python study_installer.py --study report-india-synthetic-0.2.0.tar.gz
+```
+
+Install the included synthetic RePORT India and NHANES study packages, then start the
+server:
+
+```bash
+python study_installer.py --study \
+  report-india-synthetic-0.4.0.tar.gz \
+  nhanes-2017-2018-0.3.0.tar.gz
 python run_fastapi.py
 ```
 
-On the first native start, choose where to keep study data and local runtime
-data, then choose the AI model provider (OpenAI, Anthropic Claude, or a custom
-OpenAI-compatible endpoint). Re-open the provider menu any time with
-`python run_fastapi.py --reconfigure`. These folders hold conversations,
-uploads, generated datasets, and results; it is intentionally not committed.
+The installer prompts for a study-package folder. On first startup, choose a
+runtime-data folder and configure OpenAI or Anthropic. To change providers
+later, run `python run_fastapi.py --reconfigure`.
 
-You will then be asked to enter the API key for each provider backing the
-configured models (OpenAI by default), so have it ready. Once verified, the
-app prints the following local address:
+By default, the application is available at:
 
 <http://127.0.0.1:8000/>
 
 ## Model providers
 
-Models are configured in `config/app.env`:
+- `OPENAI_API_KEY` enables the registered OpenAI models.
+- `ANTHROPIC_API_KEY` enables the registered Anthropic models.
 
-- `REPORT_AGENT_ALLOWED_MODELS` may mix OpenAI models (`gpt-*`, needs
-  `OPENAI_API_KEY`), Anthropic models (`claude-opus-5`, `claude-sonnet-5`,
-  `claude-haiku-4-5`, needs `ANTHROPIC_API_KEY`), and custom
-  OpenAI-compatible models served by e.g. vLLM.
-- `REPORT_AGENT_MODEL` selects the default model and must appear in the
-  allowed list. The startup provider menu writes both values to `.env`;
-  `--reconfigure` re-opens the menu.
-- Custom endpoints are registered in `config/custom_models.json` (see
-  `config/custom_models.example.json`): each entry names the endpoint's
-  `base_url`, the served model name, optional token limits, and an optional
-  `api_key_env` variable for its key.
-
-Database extraction (DB-RAG semantic search) always embeds queries with
-OpenAI, so it needs `OPENAI_API_KEY` even when chatting with Claude or a
-custom model; without it the app still runs and reports database search as
-not configured.
-
-## Included demo data
-
-The study uses a synthetic RePORT India database, its schema
-catalog, a matching OpenAI embedding index, verified publication summaries, and
-study-design metadata. No raw source data or original papers are included.
-
-The `data/` folder also includes small synthetic CSV files and a matching
-column dictionary for attachment and analysis demonstrations.
+Semantic search uses the built-in OpenAI `text-embedding-3-large` model and
+requires `OPENAI_API_KEY`, even when the chat model is Claude. If OpenAI
+embeddings are unavailable, search falls back to lexical matching.
 
 ## Safety note
 
-Local Python analysis is bounded for accidental or model-generated mistakes. It
-is not a security sandbox for hostile code; use the demo only with files and
-requests you trust.
+Local Python analysis is not a security sandbox. Use the demo only with files
+and requests you trust.

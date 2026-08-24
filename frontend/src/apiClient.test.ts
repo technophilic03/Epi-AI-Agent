@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ApiError,
-  artifactUrl,
-  conversationAttachmentUrl,
   createApiClient,
   createThread,
   deleteConversation,
@@ -12,6 +10,7 @@ import {
   listConversations,
   markConversationOpened,
   archiveConversation,
+  cancelRun,
   renameConversation,
   restoreConversation,
   getRuntimeInfo,
@@ -19,7 +18,6 @@ import {
   resumeInterrupt,
   resetThread,
   submitMessage,
-  threadExportUrl,
   uploadAttachments,
 } from "./apiClient";
 import type {
@@ -46,6 +44,28 @@ const threadState: ApiThreadState = {
     updated_at: null,
   },
   conversation: [],
+  activity_runs: [
+    {
+      id: "run-1",
+      thread_id: "thread-1",
+      user_message_id: "user-1",
+      state: "running",
+      activities: [
+        {
+          id: "activity-1",
+          sequence: 1,
+          label: "Understanding your request",
+          status: "running",
+          tool_name: null,
+          tool_call_id: null,
+          created_at: "2026-08-11T00:00:00+00:00",
+          updated_at: "2026-08-11T00:00:00+00:00",
+        },
+      ],
+      created_at: "2026-08-11T00:00:00+00:00",
+      updated_at: "2026-08-11T00:00:00+00:00",
+    },
+  ],
   active_interrupt: null,
   runtime_settings: null,
   runtime_settings_locked: false,
@@ -53,6 +73,18 @@ const threadState: ApiThreadState = {
   file_artifacts: [],
   output: {},
   diagnostics: {},
+  embedding_startup_status: {
+    profile_id: "configured",
+    profile_label: "Configured embedding profile",
+    provider: "unknown",
+    index_compatibility: "",
+    available: true,
+    retrieval_mode: "hybrid_vector_lexical",
+    reason_code: null,
+    message: "",
+    compatible_study_ids: [],
+    incompatible_study_ids: [],
+  },
 };
 
 const runtimeInfo = {
@@ -93,7 +125,6 @@ const runtimeOptions = {
       label: "gpt-5.4 (Standard)",
       provider: "openai",
       provider_label: "OpenAI",
-      reasoning_tier: "standard",
       summary: "Reliable general-purpose default.",
       initial_output_tokens: 8_192,
       automatic_output_token_ceiling: 16_384,
@@ -113,6 +144,60 @@ const approvePayload: ResumeInterruptPayload = {
 };
 
 describe("apiClient", () => {
+  it("sends local requests without authentication or session headers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ items: [] }));
+    const client = createApiClient({
+      apiBase: "http://api.test",
+      fetchImpl: fetchMock,
+    });
+
+    await client.listConversations();
+
+    const request = new Request(fetchMock.mock.calls[0][0], fetchMock.mock.calls[0][1]);
+    expect(request.headers.get("Authorization")).toBeNull();
+    expect(request.headers.get("X-Epi-Session-ID")).toBeNull();
+  });
+
+  it("fetches protected attachment blobs through the bound client", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("image", { headers: { "Content-Type": "image/png" } }),
+    );
+    const client = createApiClient({
+      apiBase: "http://api.test",
+      fetchImpl: fetchMock,
+    });
+
+    await expect(client.fetchAttachmentBlob("thread-1", "attachment-1")).resolves.toMatchObject({
+      size: 5,
+      type: "image/png",
+    });
+
+    const request = new Request(fetchMock.mock.calls[0][0], fetchMock.mock.calls[0][1]);
+    expect(request.url).toBe("http://api.test/api/threads/thread-1/attachments/attachment-1");
+  });
+
+  it("fetches artifact, dataset, and thread-export blobs through the bound client", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(new Response("file", { headers: { "Content-Type": "text/csv" } })),
+    );
+    const client = createApiClient({
+      apiBase: "http://api.test",
+      fetchImpl: fetchMock,
+    });
+
+    await Promise.all([
+      client.fetchArtifactBlob("thread-1", "artifact-1"),
+      client.fetchDatasetBlob("thread-1", "dataset-1"),
+      client.fetchThreadExportBlob("thread-1"),
+    ]);
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://api.test/api/threads/thread-1/artifacts/artifact-1",
+      "http://api.test/api/threads/thread-1/datasets/dataset-1/download",
+      "http://api.test/api/threads/thread-1/export.zip",
+    ]);
+  });
+
   it("lists saved conversations", async () => {
     const response = {
       items: [
@@ -252,6 +337,22 @@ describe("apiClient", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/threads/thread-1/state");
   });
 
+  it("cancels the active run and returns the restored thread state", async () => {
+    const cancelledState = {
+      ...threadState,
+      run: { ...threadState.run, state: "cancelled" as const },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(cancelledState));
+
+    await expect(
+      cancelRun(fetchMock, "http://api.test", "thread with/slash"),
+    ).resolves.toEqual(cancelledState);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/threads/thread%20with%2Fslash/cancel",
+      { method: "POST" },
+    );
+  });
+
   it("gets runtime info", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(runtimeInfo));
 
@@ -273,6 +374,7 @@ describe("apiClient", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/runtime/options",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -463,13 +565,14 @@ describe("apiClient", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://127.0.0.1:8000/api/runtime",
+      { headers: expect.any(Headers) },
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       "http://127.0.0.1:8000/api/threads/thread-1/messages",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ text: "Find NIH grants" }),
       },
     );
@@ -478,7 +581,7 @@ describe("apiClient", () => {
       "http://127.0.0.1:8000/api/threads/thread-1/interrupts/interrupt-1/resume",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: expect.any(Headers),
         body: JSON.stringify({ action: "cancel" }),
       },
     );
@@ -498,11 +601,30 @@ describe("apiClient", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/threads", {
       method: "POST",
+      headers: expect.any(Headers),
     });
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       "/api/threads/thread-1/state",
+      { headers: expect.any(Headers) },
     );
+  });
+
+  it("cancels a run without authentication headers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(threadState));
+    const client = createApiClient({
+      apiBase: "http://api.test",
+      fetchImpl: fetchMock,
+    });
+
+    await client.cancelRun("thread-1");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://api.test/api/threads/thread-1/cancel");
+    expect(init).toEqual({ method: "POST", headers: expect.any(Headers) });
+    const request = new Request(url, init);
+    expect(request.headers.get("Authorization")).toBeNull();
+    expect(request.headers.get("X-Epi-Session-ID")).toBeNull();
   });
 
   it("resets a thread", async () => {
@@ -517,12 +639,6 @@ describe("apiClient", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/threads/thread-1/reset", {
       method: "POST",
     });
-  });
-
-  it("builds encoded thread export URLs", () => {
-    expect(threadExportUrl("http://api.test/", "thread with/slash")).toBe(
-      "http://api.test/api/threads/thread%20with%2Fslash/export.zip",
-    );
   });
 
   it("uploads all selected message attachments under the files key", async () => {
@@ -551,7 +667,7 @@ describe("apiClient", () => {
     expect(init.body.getAll("files")).toEqual([csv, xml]);
   });
 
-  it("discards a staged attachment and builds its conversation URL", async () => {
+  it("discards a staged attachment", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(null, { status: 204 }),
     );
@@ -566,15 +682,6 @@ describe("apiClient", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread%20with%2Fslash/attachments/attachment%20with%2Fslash",
       { method: "DELETE" },
-    );
-    expect(
-      conversationAttachmentUrl(
-        "http://api.test/",
-        "thread with/slash",
-        "attachment with/slash",
-      ),
-    ).toBe(
-      "http://api.test/api/threads/thread%20with%2Fslash/attachments/attachment%20with%2Fslash",
     );
   });
 
@@ -597,6 +704,7 @@ describe("apiClient", () => {
     expect(preview.rows).toEqual([{ subject_id: "SUB-1" }]);
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread-1/datasets/subset-1/preview?limit=25",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -617,6 +725,7 @@ describe("apiClient", () => {
     expect(schema.schema).toEqual({ subject_id: { dataType: "string" } });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread-1/datasets/subset-1/schema",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -639,6 +748,7 @@ describe("apiClient", () => {
       .resolves.toMatchObject({ dataset_id: "subset-1", sql: 'SELECT "AGE" FROM "Index Baseline"' });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread-1/datasets/subset-1/provenance",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -664,27 +774,7 @@ describe("apiClient", () => {
       .resolves.toMatchObject({ analysis_run_id: "analysis-1", python_code: "print('exact')" });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread-1/analysis-runs/analysis-1",
-    );
-  });
-
-  it("builds encoded dataset download URLs", () => {
-    const client = createApiClient({
-      apiBase: "http://api.test/",
-      fetchImpl: vi.fn(),
-    });
-
-    expect(
-      client.datasetDownloadUrl("thread with/slash", "subset with/slash"),
-    ).toBe(
-      "http://api.test/api/threads/thread%20with%2Fslash/datasets/subset%20with%2Fslash/download",
-    );
-  });
-
-  it("builds encoded artifact URLs", () => {
-    expect(
-      artifactUrl("http://api.test/", "thread with/slash", "figure with/slash"),
-    ).toBe(
-      "http://api.test/api/threads/thread%20with%2Fslash/artifacts/figure%20with%2Fslash",
+      { headers: expect.any(Headers) },
     );
   });
 
@@ -706,6 +796,7 @@ describe("apiClient", () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/threads/thread-1/artifacts/table-1/table-preview?limit=100",
+      { headers: expect.any(Headers) },
     );
   });
 

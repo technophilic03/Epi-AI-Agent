@@ -6,6 +6,11 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from db_rag.local_knowledge import (
+    SemanticPublicationKnowledgeUnavailableError,
+)
+from db_rag.config import EMBEDDING_MODEL
+from db_rag.retrieval_status import RetrievalOutcome, hybrid_status
 from epi_agent.protocol import (
     ArtifactStore,
     ToolContext,
@@ -30,14 +35,22 @@ _MAX_EXCERPT_CHARS = 500
 class SearchStudyEvidenceArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    study_id: str = Field(min_length=1, max_length=512)
     query: str = Field(min_length=1, max_length=8_000)
     limit: int = Field(default=5, ge=1)
+
+
+class StudySourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    study_id: str = Field(min_length=1, max_length=512)
+    source_id: str = Field(min_length=1, max_length=512)
 
 
 class OpenStudySourceArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    source_id: str = Field(min_length=1, max_length=512)
+    source_ref: StudySourceRef
 
 
 class SearchPubMedArguments(BaseModel):
@@ -88,9 +101,11 @@ def _field(value: Any, name: str) -> Any:
     return getattr(value, name, None)
 
 
-def _evidence_hit(value: Any) -> dict[str, str]:
+def _evidence_hit(value: Any, *, study_id: str) -> dict[str, Any]:
+    provenance = _field(value, "provenance")
+    source_id = _bounded(_field(value, "source_id"))
     row = {
-        "source_id": _bounded(_field(value, "source_id")),
+        "source_id": source_id,
         "title": _bounded(_field(value, "title")),
         "section": _bounded(_field(value, "section")),
         "excerpt": _bounded(_field(value, "text")),
@@ -99,8 +114,15 @@ def _evidence_hit(value: Any) -> dict[str, str]:
         "source_locator": _bounded(_field(value, "source_locator")),
         "indexed_path": _bounded(_field(value, "indexed_path")),
         "evidence_ids": _bounded(_field(value, "evidence_ids")),
+        "matched_by": _bounded(_field(provenance, "matched_by")),
     }
-    return {key: item for key, item in row.items() if item}
+    result: dict[str, Any] = {key: item for key, item in row.items() if item}
+    if source_id:
+        result["source_ref"] = {
+            "study_id": study_id,
+            "source_id": source_id,
+        }
+    return result
 
 
 def _save_observation(
@@ -110,14 +132,14 @@ def _save_observation(
     content: dict[str, Any],
     producer: str,
     summary: str,
+    study_id: str | None = None,
 ):
-    study = context.study
     provenance = {
         "thread_id": context.thread_id,
         "producer": producer,
     }
-    if study is not None:
-        provenance["study_id"] = study.study_id
+    if study_id:
+        provenance["study_id"] = study_id
     return _store(context).save_artifact(
         kind=kind,
         content=content,
@@ -130,7 +152,7 @@ def _search(
     arguments: dict[str, Any],
     context: ToolContext,
 ) -> ToolResult:
-    study = require_context_study(context)
+    study = require_context_study(context, arguments["study_id"])
     search = getattr(study.knowledge, "search", None)
     if not callable(search):
         raise ToolExecutionError(
@@ -139,19 +161,45 @@ def _search(
             recoverable=True,
         )
     limit = min(int(arguments["limit"]), _MAX_SEARCH_HITS)
-    hits = [
-        _evidence_hit(hit)
-        for hit in search(arguments["query"], limit=limit)
-    ][:limit]
+    try:
+        search_with_status = getattr(study.knowledge, "search_with_status", None)
+        outcome = (
+            search_with_status(arguments["query"], limit=limit)
+            if callable(search_with_status)
+            else RetrievalOutcome(
+                value=search(arguments["query"], limit=limit),
+                status=hybrid_status(
+                    getattr(study.knowledge, "embedding_model", EMBEDDING_MODEL)
+                ),
+            )
+        )
+        hits = [
+            _evidence_hit(hit, study_id=study.study_id)
+            for hit in outcome.value
+        ][:limit]
+    except SemanticPublicationKnowledgeUnavailableError as error:
+        raise ToolExecutionError(
+            "SEMANTIC_STUDY_KNOWLEDGE_UNAVAILABLE",
+            str(error),
+            recoverable=True,
+        ) from error
+    content = {
+        "study_id": study.study_id,
+        "query": arguments["query"],
+        "retrieval_mode": outcome.status.mode,
+        "embedding": outcome.status.as_dict(),
+        "hits": hits,
+    }
     reference = _save_observation(
         context,
         kind="study_evidence",
-        content={"query": arguments["query"], "hits": hits},
+        content=content,
         producer="publication-search_study_evidence",
         summary=f"{len(hits)} publication evidence hits",
+        study_id=study.study_id,
     )
     return ToolResult(
-        message=json.dumps({"hits": hits}, sort_keys=True),
+        message=json.dumps(content, sort_keys=True),
         artifacts=(reference,),
     )
 
@@ -160,7 +208,8 @@ def _open_source(
     arguments: dict[str, Any],
     context: ToolContext,
 ) -> ToolResult:
-    study = require_context_study(context)
+    source_ref = StudySourceRef.model_validate(arguments["source_ref"])
+    study = require_context_study(context, source_ref.study_id)
     open_source = getattr(study.knowledge, "open_source", None)
     if not callable(open_source):
         raise ToolExecutionError(
@@ -168,9 +217,9 @@ def _open_source(
             "The active study does not provide exact publication lookup.",
             recoverable=True,
         )
-    source_id = arguments["source_id"]
+    source_id = source_ref.source_id
     hits = [
-        _evidence_hit(hit)
+        _evidence_hit(hit, study_id=study.study_id)
         for hit in open_source(source_id, limit=_MAX_SEARCH_HITS)
     ][:_MAX_SEARCH_HITS]
     if not hits:
@@ -182,9 +231,13 @@ def _open_source(
     reference = _save_observation(
         context,
         kind="study_source",
-        content={"source_id": source_id, "sections": hits},
+        content={
+            "source_ref": source_ref.model_dump(mode="json"),
+            "sections": hits,
+        },
         producer="publication-open_study_source",
         summary=f"{len(hits)} bounded sections from {source_id}",
+        study_id=study.study_id,
     )
     return ToolResult(
         message=(
@@ -283,7 +336,7 @@ def build_publication_tool_registry(
                     name="publication-search_study_evidence",
                     description=(
                         "Search manually verified publication-design evidence "
-                        "and store bounded cited hits."
+                        "within one exact installed study and store bounded cited hits."
                     ),
                     args_model=SearchStudyEvidenceArguments,
                 ),
@@ -294,7 +347,7 @@ def build_publication_tool_registry(
                     name="publication-open_study_source",
                     description=(
                         "Open bounded sections from one exact cited "
-                        "publication source."
+                        "study-scoped publication source reference."
                     ),
                     args_model=OpenStudySourceArguments,
                 ),
@@ -342,5 +395,6 @@ __all__ = [
     "OpenPubMedArticleArguments",
     "SearchPubMedArguments",
     "SearchStudyEvidenceArguments",
+    "StudySourceRef",
     "build_publication_tool_registry",
 ]

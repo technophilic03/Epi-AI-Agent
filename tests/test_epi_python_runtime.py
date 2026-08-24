@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+import inspect
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+import pandas as pd
+import pytest
+
+from epi_agent.runtimes.python import LocalPythonRuntime, PythonExecutionRequest
+from epi_agent.runtimes.python import local_process
+
+
+class _SuccessfulWorker:
+    returncode = 0
+
+    def __init__(self, command: list[str], **kwargs: Any) -> None:
+        self.command = command
+        self.kwargs = kwargs
+        output_dir = Path(command[command.index("--output-dir") + 1])
+        (output_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "output_text": "ok",
+                    "runtime": {"version": "test"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+        del timeout
+        return b"", b""
+
+
+def test_python_runtime_uses_native_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched: list[_SuccessfulWorker] = []
+
+    def popen(command: list[str], **kwargs: Any) -> _SuccessfulWorker:
+        process = _SuccessfulWorker(command, **kwargs)
+        launched.append(process)
+        return process
+
+    for name in (
+        "OPENAI_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    ):
+        monkeypatch.setenv(name, "must-not-reach-python-worker")
+    monkeypatch.setattr(local_process.subprocess, "Popen", popen)
+    runtime = LocalPythonRuntime(
+        runtime_root=tmp_path,
+        memory_limit_bytes=None,
+    )
+
+    result = runtime.execute(
+        PythonExecutionRequest(
+            code="print(len(dataset))",
+            selected_dataset_id="dataset",
+        ),
+        {"dataset": pd.DataFrame({"value": [1]})},
+    )
+
+    assert result.output_text == "ok"
+    assert len(launched) == 1
+    command = launched[0].command
+    expected_prefix = [
+        sys.executable,
+        str(Path(local_process.__file__).with_name("worker.py")),
+    ]
+    assert command[: len(expected_prefix)] == expected_prefix
+    assert command[len(expected_prefix) :] == [
+        "--input-dir",
+        command[len(expected_prefix) + 1],
+        "--output-dir",
+        command[len(expected_prefix) + 3],
+    ]
+    environment = launched[0].kwargs["env"]
+    assert {
+        name: environment[name]
+        for name in (
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        )
+    } == {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+    }
+    assert all(
+        name not in environment
+        for name in (
+            "OPENAI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        )
+    )
+
+
+def test_python_runtime_uses_adaptive_nproc_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_process, "_nproc_limit", lambda: 384, raising=False)
+
+    limits = {
+        name: (soft, hard)
+        for name, soft, hard in local_process._resource_limit_specs(
+            timeout_seconds=60,
+            memory_limit_bytes=None,
+            platform_name="linux",
+        )
+    }
+
+    assert limits["RLIMIT_NPROC"] == (384, 384)
+
+
+def test_python_runtime_has_no_hosted_launcher_interface() -> None:
+    assert "worker_launcher" not in inspect.signature(
+        LocalPythonRuntime
+    ).parameters

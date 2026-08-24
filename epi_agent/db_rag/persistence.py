@@ -7,7 +7,6 @@ from db_rag.service.dataset_naming import generate_dataset_name
 from db_rag.service.schema import _lookup_schema_variable_metadata
 from graph.state import MetaKeys
 from utils.dataset_artifacts import (
-    DEFAULT_RUNTIME_ROOT,
     StagedDatasetArtifact,
     persist_dataset_artifact,
     register_dataset_artifact,
@@ -331,6 +330,7 @@ def persist_sql_subset_artifact(
     approved_selection: dict[str, Any],
     execution_result: Any,
     *,
+    study_id: str,
     selection_artifact_id: str | None,
     sql_candidate_artifact_id: str | None,
     plan_id: str | None = None,
@@ -355,6 +355,9 @@ def persist_sql_subset_artifact(
     dict[str, Any],
     StagedDatasetArtifact | None,
 ]:
+    normalized_study_id = str(study_id or "").strip()
+    if not normalized_study_id:
+        raise ValueError("DB-RAG SQL subset persistence requires a study_id.")
     thread_id = str(
         dict(state.get("meta") or {}).get(MetaKeys.THREAD_ID) or ""
     ).strip()
@@ -426,6 +429,7 @@ def persist_sql_subset_artifact(
         deduplicated_warnings.append(dict(warning))
     provenance: dict[str, Any] = {
         "source": "db_rag_sql",
+        "study_id": normalized_study_id,
         "thread_id": thread_id,
         "source_question": source_question,
         "goal_text": goal_text,
@@ -508,7 +512,7 @@ def persist_sql_subset_artifact(
         )
 
     persistence_arguments = {
-        "runtime_root": runtime_root or DEFAULT_RUNTIME_ROOT,
+        "runtime_root": runtime_root,
         "thread_id": thread_id,
         "dataset_id": str(dataset_id or "").strip()
         or f"subset-{uuid4().hex[:8]}",
@@ -535,7 +539,6 @@ def persist_sql_subset_artifact(
 
 
 __all__ = [
-    "DEFAULT_RUNTIME_ROOT",
     "persist_sql_subset_artifact",
     "serialize_columns",
 ]

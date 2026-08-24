@@ -4,8 +4,21 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from db_rag.embedding_startup import (
+    EmbeddingStartupStatus,
+    silent_embedding_startup_status,
+)
 
-RunState = Literal["idle", "running", "interrupted", "done", "error", "timeout"]
+
+RunState = Literal[
+    "idle",
+    "running",
+    "interrupted",
+    "done",
+    "cancelled",
+    "error",
+    "timeout",
+]
 
 
 class RunStatus(BaseModel):
@@ -67,7 +80,7 @@ class ModelOption(BaseModel):
     label: str
     provider: Literal["openai", "anthropic", "openai_compatible"] = "openai"
     provider_label: str = "OpenAI"
-    reasoning_tier: Literal["standard", "low", "medium", "high"]
+    supports_sampling_controls: bool
     summary: str
     initial_output_tokens: int = Field(gt=0)
     automatic_output_token_ceiling: int = Field(gt=0)
@@ -83,6 +96,9 @@ class RuntimeOptions(BaseModel):
     defaults: RuntimeSettings
     models: list[ModelOption] = Field(default_factory=list)
     capabilities: RuntimeCapabilities
+    embedding_startup_status: EmbeddingStartupStatus = Field(
+        default_factory=silent_embedding_startup_status
+    )
 
 
 class ConversationAttachment(BaseModel):
@@ -107,6 +123,7 @@ class ConversationMessage(BaseModel):
     id: str
     role: Literal["user", "assistant", "system"]
     text: str
+    status: Literal["cancelled"] | None = None
     created_at: str | None = None
     attachments: list[ConversationAttachment] = Field(default_factory=list)
     clarifications: list[ClarificationExchange] = Field(default_factory=list)
@@ -365,14 +382,52 @@ class DatasetPreview(BaseModel):
 
 
 class DatasetSchemaResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     dataset_id: str
-    schema: dict[str, Any] = Field(default_factory=dict)
+    schema_: dict[str, Any] = Field(default_factory=dict, alias="schema")
+
+
+ActivityItemStatus = Literal["running", "completed", "waiting"]
+ActivityRunState = Literal[
+    "running",
+    "waiting",
+    "completed",
+    "cancelled",
+    "error",
+]
+
+
+class ActivityItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    sequence: int = Field(ge=1)
+    label: str = Field(min_length=1, max_length=200)
+    status: ActivityItemStatus
+    tool_name: str | None = Field(default=None, max_length=200)
+    tool_call_id: str | None = Field(default=None, max_length=200)
+    created_at: str
+    updated_at: str
+
+
+class ActivityRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    user_message_id: str = Field(min_length=1)
+    state: ActivityRunState
+    activities: list[ActivityItem] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
 
 
 class ApiThreadState(BaseModel):
     thread_id: str
     run: RunStatus
     conversation: list[ConversationMessage] = Field(default_factory=list)
+    activity_runs: list[ActivityRun] = Field(default_factory=list)
     active_interrupt: ActiveInterrupt | None = None
     datasets: list[DatasetSummary] = Field(default_factory=list)
     file_artifacts: list[FileArtifactSummary] = Field(default_factory=list)
@@ -381,6 +436,12 @@ class ApiThreadState(BaseModel):
     runtime_settings: RuntimeSettings | None = None
     runtime_settings_locked: bool = False
     model_name: str = ""
+    model_label: str = ""
+    model_available: bool = True
+    model_replacement_required: bool = False
+    embedding_startup_status: EmbeddingStartupStatus = Field(
+        default_factory=silent_embedding_startup_status
+    )
 
 
 class CreateThreadRequest(BaseModel):
@@ -398,6 +459,7 @@ class ConversationSummary(BaseModel):
     updated_at: str
     last_opened_at: str | None = None
     archived_at: str | None = None
+    awaiting_review: bool = False
 
 
 class ConversationHistoryResponse(BaseModel):
@@ -405,6 +467,8 @@ class ConversationHistoryResponse(BaseModel):
 
 
 class RenameConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(min_length=1, max_length=120)
 
 
@@ -418,7 +482,6 @@ class SubmitMessageRequest(BaseModel):
     text: str = ""
     attachment_ids: list[str] = Field(default_factory=list)
     model_name: str | None = None
-    active_study_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def require_content(self) -> "SubmitMessageRequest":

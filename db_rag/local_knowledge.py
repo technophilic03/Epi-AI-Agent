@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import re
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -15,6 +16,13 @@ from db_rag.knowledge import (
     StudyEvidenceChunk,
     parse_study_evidence,
 )
+from db_rag.config import EMBEDDING_MODEL
+from db_rag.retrieval_status import (
+    EmbeddingReasonCode,
+    RetrievalOutcome,
+    hybrid_status,
+    lexical_fallback_status,
+)
 from db_rag.publication_index import (
     PublicationDesignIndex,
     PublicationIndexIngestionManifest,
@@ -22,6 +30,11 @@ from db_rag.publication_index import (
 
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+_RRF_K = 60
+
+
+class SemanticPublicationKnowledgeUnavailableError(RuntimeError):
+    """The selected study cannot perform mandatory publication retrieval."""
 
 
 def _tokens(value: str) -> list[str]:
@@ -129,7 +142,7 @@ class LocalPublicationKnowledge:
             )
         return cls(chunks, dict(document_frequency))
 
-    def search(
+    def search_lexical(
         self,
         query: str,
         *,
@@ -190,6 +203,28 @@ class LocalPublicationKnowledge:
         )
         return [_hit(chunk) for _score, chunk in scored[:limit]]
 
+    def search_with_status(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        embedding_model: str = EMBEDDING_MODEL,
+        embedding_provider: str | None = None,
+        embedding_credential_env: str | None = None,
+        reason_code: EmbeddingReasonCode = (
+            "EMBEDDING_CONFIGURATION_UNAVAILABLE"
+        ),
+    ) -> RetrievalOutcome[list[PublicationEvidenceHit]]:
+        return RetrievalOutcome(
+            value=self.search_lexical(query, limit=limit),
+            status=lexical_fallback_status(
+                embedding_model,
+                reason_code,
+                provider=embedding_provider,
+                credential_env=embedding_credential_env,
+            ),
+        )
+
     def open_source(
         self,
         source_id: str,
@@ -209,4 +244,226 @@ class LocalPublicationKnowledge:
         return [_hit(chunk) for chunk in chunks[:limit]]
 
 
-__all__ = ["LocalPublicationKnowledge"]
+def _fuse_hits(
+    vector_hits: list[PublicationEvidenceHit],
+    lexical_hits: list[PublicationEvidenceHit],
+    *,
+    limit: int,
+) -> list[PublicationEvidenceHit]:
+    scores: dict[str, float] = {}
+    hits_by_id: dict[str, PublicationEvidenceHit] = {}
+    matched_by: dict[str, list[str]] = {}
+    for mode, hits in (("vector", vector_hits), ("lexical", lexical_hits)):
+        seen: set[str] = set()
+        for rank, hit in enumerate(hits, start=1):
+            if hit.id in seen:
+                continue
+            seen.add(hit.id)
+            hits_by_id.setdefault(hit.id, hit)
+            scores[hit.id] = scores.get(hit.id, 0.0) + 1.0 / (_RRF_K + rank)
+            matched_by.setdefault(hit.id, []).append(mode)
+    ordered_ids = sorted(
+        scores,
+        key=lambda chunk_id: (-scores[chunk_id], chunk_id),
+    )[:limit]
+    results: list[PublicationEvidenceHit] = []
+    for chunk_id in ordered_ids:
+        hit = hits_by_id[chunk_id]
+        results.append(
+            hit.model_copy(
+                update={
+                    "provenance": {
+                        **hit.provenance,
+                        "matched_by": ",".join(matched_by[chunk_id]),
+                    }
+                }
+            )
+        )
+    return results
+
+
+@dataclass(frozen=True)
+class SemanticPublicationKnowledge:
+    _local: LocalPublicationKnowledge
+    _collection: Any
+    _embedding_function: Any
+    embedding_model: str
+    embedding_provider: str | None
+    embedding_credential_env: str | None
+
+    def __init__(
+        self,
+        local: LocalPublicationKnowledge,
+        *,
+        collection: Any,
+        embedding_function: Any,
+        embedding_model: str = EMBEDDING_MODEL,
+        embedding_provider: str | None = None,
+        embedding_credential_env: str | None = None,
+    ) -> None:
+        object.__setattr__(self, "_local", local)
+        object.__setattr__(self, "_collection", collection)
+        object.__setattr__(self, "_embedding_function", embedding_function)
+        object.__setattr__(self, "embedding_model", embedding_model)
+        object.__setattr__(self, "embedding_provider", embedding_provider)
+        object.__setattr__(
+            self,
+            "embedding_credential_env",
+            embedding_credential_env,
+        )
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> list[PublicationEvidenceHit]:
+        return self.search_with_status(query, limit=limit).value
+
+    def search_with_status(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> RetrievalOutcome[list[PublicationEvidenceHit]]:
+        if limit < 1 or not query.strip() or not self._local._chunks:
+            return RetrievalOutcome(
+                value=[],
+                status=hybrid_status(
+                    self.embedding_model,
+                    provider=self.embedding_provider,
+                ),
+            )
+        candidate_limit = limit * 2
+        try:
+            embeddings = self._embedding_function.embed_query([query])
+        except Exception:
+            return self._local.search_with_status(
+                query,
+                limit=limit,
+                embedding_model=self.embedding_model,
+                embedding_provider=self.embedding_provider,
+                embedding_credential_env=self.embedding_credential_env,
+                reason_code="EMBEDDING_PROVIDER_UNAVAILABLE",
+            )
+        if len(embeddings) != 1:
+            raise SemanticPublicationKnowledgeUnavailableError(
+                "Publication embedding response is malformed."
+            )
+        try:
+            result = self._collection.query(
+                query_embeddings=embeddings,
+                n_results=candidate_limit,
+                where={"source_kind": "publication"},
+                include=["metadatas"],
+            )
+        except Exception:
+            return self._local.search_with_status(
+                query,
+                limit=limit,
+                embedding_model=self.embedding_model,
+                embedding_provider=self.embedding_provider,
+                embedding_credential_env=self.embedding_credential_env,
+                reason_code="EMBEDDING_INDEX_UNAVAILABLE",
+            )
+        try:
+            ids = list(result["ids"][0])
+            metadatas = list(result["metadatas"][0])
+            if len(ids) != len(metadatas):
+                raise ValueError("Publication vector result is malformed.")
+            verified_chunks = {
+                chunk.id: chunk
+                for chunk in self._local._chunks
+            }
+            vector_hits: list[PublicationEvidenceHit] = []
+            seen_ids: set[str] = set()
+            for chunk_id, metadata in zip(ids, metadatas):
+                normalized_id = str(chunk_id)
+                chunk = verified_chunks.get(normalized_id)
+                if (
+                    chunk is None
+                    or normalized_id in seen_ids
+                    or not isinstance(metadata, dict)
+                ):
+                    raise ValueError("Publication vector result is unverified.")
+                expected_metadata = chunk.chroma_metadata()
+                if any(
+                    str(metadata.get(key) or "") != str(expected_value)
+                    for key, expected_value in expected_metadata.items()
+                ):
+                    raise ValueError("Publication vector metadata is stale.")
+                seen_ids.add(normalized_id)
+                vector_hits.append(_hit(chunk))
+            if not vector_hits:
+                raise ValueError("Publication vector partition is empty.")
+        except Exception as error:
+            raise SemanticPublicationKnowledgeUnavailableError(
+                "Semantic publication result failed provenance validation."
+            ) from error
+        lexical_hits = self._local.search_lexical(
+            query,
+            limit=candidate_limit,
+        )
+        return RetrievalOutcome(
+            value=_fuse_hits(vector_hits, lexical_hits, limit=limit),
+            status=hybrid_status(
+                self.embedding_model,
+                provider=self.embedding_provider,
+            ),
+        )
+
+    def open_source(
+        self,
+        source_id: str,
+        *,
+        limit: int = 10,
+    ) -> list[PublicationEvidenceHit]:
+        return self._local.open_source(source_id, limit=limit)
+
+
+@dataclass(frozen=True)
+class UnavailableSemanticPublicationKnowledge:
+    _local: LocalPublicationKnowledge
+    embedding_model: str = EMBEDDING_MODEL
+    embedding_provider: str | None = None
+    embedding_credential_env: str | None = None
+    reason_code: EmbeddingReasonCode = "EMBEDDING_CREDENTIALS_MISSING"
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> list[PublicationEvidenceHit]:
+        return self.search_with_status(query, limit=limit).value
+
+    def search_with_status(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> RetrievalOutcome[list[PublicationEvidenceHit]]:
+        return self._local.search_with_status(
+            query,
+            limit=limit,
+            embedding_model=self.embedding_model,
+            embedding_provider=self.embedding_provider,
+            embedding_credential_env=self.embedding_credential_env,
+            reason_code=self.reason_code,
+        )
+
+    def open_source(
+        self,
+        source_id: str,
+        *,
+        limit: int = 10,
+    ) -> list[PublicationEvidenceHit]:
+        return self._local.open_source(source_id, limit=limit)
+
+
+__all__ = [
+    "LocalPublicationKnowledge",
+    "SemanticPublicationKnowledge",
+    "SemanticPublicationKnowledgeUnavailableError",
+    "UnavailableSemanticPublicationKnowledge",
+]

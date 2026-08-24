@@ -161,6 +161,8 @@ def _message_kwargs_for_event(event: dict) -> dict:
     created_at = event.get("created_at")
     if isinstance(created_at, str) and created_at.strip():
         additional_kwargs["created_at"] = created_at
+    if event.get("status") == "cancelled":
+        additional_kwargs["status"] = "cancelled"
     return additional_kwargs
 
 
@@ -268,20 +270,3 @@ def build_display_history(state: dict) -> list:
         if event_type == "assistant" and isinstance(user_turn_hash, str):
             assistant_text_by_turn_hash[user_turn_hash] = text
     return display_messages
-
-
-def serialize_display_history(messages: list) -> list[dict[str, object]]:
-    serialized: list[dict[str, object]] = []
-    for index, message in enumerate(messages, start=1):
-        role = "assistant"
-        if getattr(message, "type", None) == "human" or isinstance(message, HumanMessage):
-            role = "user"
-        serialized.append(
-            {
-                "index": index,
-                "role": role,
-                "content": str(getattr(message, "content", "") or ""),
-                "additional_kwargs": dict(getattr(message, "additional_kwargs", {}) or {}),
-            }
-        )
-    return serialized

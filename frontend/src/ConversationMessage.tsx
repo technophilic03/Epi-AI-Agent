@@ -13,7 +13,7 @@ import type {
 import type { ReactNode } from "react";
 
 interface Props {
-  attachmentUrl: (attachmentId: string) => string;
+  fetchAttachmentBlob: (attachmentId: string) => Promise<Blob>;
   getDatasetPreview?: (
     attachmentId: string,
     limit: number,
@@ -327,7 +327,7 @@ function renderMarkdownText(text: string, keyPrefix: string) {
 }
 
 export default function ConversationMessage({
-  attachmentUrl,
+  fetchAttachmentBlob,
   getDatasetPreview,
   getDatasetSchema,
   getDatasetProvenance,
@@ -386,11 +386,21 @@ export default function ConversationMessage({
 
   return (
     <li
-      className={`message message-bounded message-${message.role}`}
+      className={`message message-bounded message-${message.role}${
+        message.status === "cancelled" ? " message-cancelled" : ""
+      }`}
       id={`message-${message.id}`}
     >
       <div className="message-bubble message-bubble-bounded">
         <span className="message-role">{message.role}</span>
+        {message.status === "cancelled" ? (
+          <span
+            aria-label="Message status: Cancelled"
+            className="message-status message-status-cancelled"
+          >
+            Cancelled
+          </span>
+        ) : null}
         <div className="message-body">
           {parts.map((part, index) => {
             if (part.type === "code") {
@@ -450,7 +460,7 @@ export default function ConversationMessage({
             {usedAttachments.map((attachment) => (
               <MessageAttachment
                 attachment={attachment}
-                attachmentUrl={attachmentUrl}
+                fetchAttachmentBlob={fetchAttachmentBlob}
                 getDatasetPreview={getDatasetPreview ?? unavailablePreview}
                 getDatasetSchema={getDatasetSchema ?? unavailablePreview}
                 getDatasetProvenance={getDatasetProvenance}
@@ -468,7 +478,7 @@ export default function ConversationMessage({
             {cardAttachments.map((attachment) => (
               <MessageAttachment
                 attachment={attachment}
-                attachmentUrl={attachmentUrl}
+                fetchAttachmentBlob={fetchAttachmentBlob}
                 getDatasetPreview={getDatasetPreview ?? unavailablePreview}
                 getDatasetSchema={getDatasetSchema ?? unavailablePreview}
                 getDatasetProvenance={getDatasetProvenance}

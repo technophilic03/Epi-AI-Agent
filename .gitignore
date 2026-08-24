@@ -1,12 +1,12 @@
 # Secrets and local environments.
 .env
 .streamlit/secrets.toml
-.venv/
+.venv
 .venv-*/
 
 # Dependency directories and generated caches.
 node_modules/
-frontend/node_modules/
+frontend/node_modules
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -16,10 +16,9 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 
-# Local-only development and generated content.
-scripts/
-tests/
+# Local-only generated content.
 runtime/
+local_data/
 
 # Local tools and scratch work.
 .worktrees/
@@ -45,7 +44,5 @@ study_data/
 
 db_rag/benchmark/
 
-
-# Deployment-specific model endpoints (example stays committed).
+# Local model endpoint configuration (example stays committed).
 config/custom_models.json
-CLAUDE.md
