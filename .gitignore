@@ -25,7 +25,9 @@ local_data/
 .superpowers/
 .github/
 AGENTS.md
-docs/
+/docs/
+/scripts/
+/tests/
 run_fastapi_typescript_app.py
 slides/
 tmp/
