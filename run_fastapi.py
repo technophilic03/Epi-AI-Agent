@@ -145,9 +145,9 @@ def _configure_provider_menu(
         if force:
             prompt = (
                 "Configure AI providers. Existing providers are retained.\n\n"
-                "1. Configure or replace OpenAI\n"
+                "1. Configure or replace OpenAI (preferred)\n"
                 "2. Configure or replace Anthropic\n"
-                "3. Connect to a compatible endpoint\n"
+                "3. Connect to a compatible endpoint (beta)\n"
                 "4. Remove OpenAI\n"
                 "5. Remove Anthropic\n"
                 "6. Keep current providers\n"
@@ -157,9 +157,9 @@ def _configure_provider_menu(
         else:
             prompt = (
                 "No AI provider is configured.\n\n"
-                "1. Configure OpenAI\n"
+                "1. Configure OpenAI (preferred)\n"
                 "2. Configure Anthropic\n"
-                "3. Connect to a compatible endpoint\n"
+                "3. Connect to a compatible endpoint (beta)\n"
                 "Selection: "
             )
             default = ""
