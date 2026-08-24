@@ -52,6 +52,14 @@ def _print_install_progress(
     print(f"[{position}/{total}] {archive.name} — {phase}", flush=True)
 
 
+def _print_install_phase(phase: str) -> None:
+    messages = {
+        "preparing": "Preparing and validating packages:",
+        "installing": "All packages validated. Installing batch:",
+    }
+    print(messages[phase], flush=True)
+
+
 def configure_study_root(
     *,
     project_root: str | Path = PROJECT_ROOT,
@@ -110,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_study_id=args.expected_study_id,
                 expected_package_version=args.expected_package_version,
                 progress=_print_install_progress,
+                phase_progress=_print_install_phase,
             )
             for package in installed:
                 for warning in package.warnings:

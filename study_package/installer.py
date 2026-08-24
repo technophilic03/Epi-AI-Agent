@@ -436,6 +436,7 @@ def install_study_archives(
     expected_study_id: str | None = None,
     expected_package_version: str | None = None,
     progress: Callable[[int, int, Path, str], None] | None = None,
+    phase_progress: Callable[[str], None] | None = None,
 ) -> tuple[InstalledStudy, ...]:
     if not archives:
         raise ValueError("At least one study archive is required")
@@ -447,6 +448,8 @@ def install_study_archives(
     staged_studies: list[StagedStudy] = []
     try:
         total = len(archives)
+        if phase_progress is not None:
+            phase_progress("preparing")
         for position, archive in enumerate(archives, start=1):
             report = None
             if progress is not None:
@@ -486,8 +489,6 @@ def install_study_archives(
         installed: list[InstalledStudy | None] = [None] * len(staged_studies)
         promotions: list[tuple[int, StagedStudy, Path]] = []
         for index, staged in enumerate(staged_studies):
-            if progress is not None:
-                progress(index + 1, total, Path(archives[index]), "installing")
             manifest = staged.manifest
             destination = package_root(
                 studies_root,
@@ -505,6 +506,12 @@ def install_study_archives(
             else:
                 promotions.append((index, staged, destination))
             active[manifest.study_id] = manifest.package_version
+
+        if phase_progress is not None:
+            phase_progress("installing")
+        if progress is not None:
+            for index, archive in enumerate(archives, start=1):
+                progress(index, total, Path(archive), "installing")
 
         for _index, staged, _destination in promotions:
             _write_installed_record(staged)
