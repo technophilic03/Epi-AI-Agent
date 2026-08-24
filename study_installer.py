@@ -43,6 +43,15 @@ def _activate_target(value: str) -> tuple[str, str]:
     return study_id, package_version
 
 
+def _print_install_progress(
+    position: int,
+    total: int,
+    archive: Path,
+    phase: str,
+) -> None:
+    print(f"[{position}/{total}] {archive.name} — {phase}", flush=True)
+
+
 def configure_study_root(
     *,
     project_root: str | Path = PROJECT_ROOT,
@@ -100,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                 studies_root,
                 expected_study_id=args.expected_study_id,
                 expected_package_version=args.expected_package_version,
+                progress=_print_install_progress,
             )
             for package in installed:
                 for warning in package.warnings:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -335,7 +335,12 @@ def validate_staged_package(
     return ()
 
 
-def stage_study_archive(archive: Path, studies_root: Path) -> StagedStudy:
+def stage_study_archive(
+    archive: Path,
+    studies_root: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> StagedStudy:
     source = Path(archive)
     if (
         source.is_symlink()
@@ -352,9 +357,15 @@ def stage_study_archive(archive: Path, studies_root: Path) -> StagedStudy:
     extracted_root = stage_root / "package"
     extracted_root.mkdir()
     try:
+        if progress is not None:
+            progress("copying")
         archive_sha256 = _copy_archive(source, copied_archive)
+        if progress is not None:
+            progress("extracting")
         _extract_archive(copied_archive, extracted_root)
         manifest = load_installed_manifest(extracted_root)
+        if progress is not None:
+            progress("validating")
         package_warnings = validate_staged_package(extracted_root, manifest)
         return StagedStudy(
             archive_path=copied_archive,
@@ -424,6 +435,7 @@ def install_study_archives(
     *,
     expected_study_id: str | None = None,
     expected_package_version: str | None = None,
+    progress: Callable[[int, int, Path, str], None] | None = None,
 ) -> tuple[InstalledStudy, ...]:
     if not archives:
         raise ValueError("At least one study archive is required")
@@ -434,8 +446,16 @@ def install_study_archives(
 
     staged_studies: list[StagedStudy] = []
     try:
-        for archive in archives:
-            staged_studies.append(stage_study_archive(archive, studies_root))
+        total = len(archives)
+        for position, archive in enumerate(archives, start=1):
+            report = None
+            if progress is not None:
+                report = lambda phase, p=position, path=Path(archive): progress(
+                    p, total, path, phase
+                )
+            staged_studies.append(
+                stage_study_archive(archive, studies_root, progress=report)
+            )
 
         if expected_study_id is not None and expected_package_version is not None:
             if len(staged_studies) != 1:
@@ -466,6 +486,8 @@ def install_study_archives(
         installed: list[InstalledStudy | None] = [None] * len(staged_studies)
         promotions: list[tuple[int, StagedStudy, Path]] = []
         for index, staged in enumerate(staged_studies):
+            if progress is not None:
+                progress(index + 1, total, Path(archives[index]), "installing")
             manifest = staged.manifest
             destination = package_root(
                 studies_root,
