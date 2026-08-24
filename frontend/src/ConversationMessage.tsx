@@ -184,6 +184,18 @@ function parseMarkdownBlocks(text: string): MarkdownBlock[] {
   return blocks.length ? blocks : [{ type: "paragraph", text }];
 }
 
+function renderLiteralDollarText(text: string, keyPrefix: string): ReactNode[] {
+  return text.split(/(\\\$)/g).map((segment, index) =>
+    segment === "\\$" ? (
+      <span className="math-literal" key={`${keyPrefix}-${index}`}>
+        $
+      </span>
+    ) : (
+      segment
+    ),
+  );
+}
+
 function renderInlineMarkdown(text: string): ReactNode[] {
   return text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((segment, index) => {
     if (segment.startsWith("`") && segment.endsWith("`") && segment.length > 1) {
@@ -198,9 +210,13 @@ function renderInlineMarkdown(text: string): ReactNode[] {
       segment.endsWith("**") &&
       segment.length > 4
     ) {
-      return <strong key={index}>{segment.slice(2, -2)}</strong>;
+      return (
+        <strong key={index}>
+          {renderLiteralDollarText(segment.slice(2, -2), `strong-${index}`)}
+        </strong>
+      );
     }
-    return segment;
+    return renderLiteralDollarText(segment, `text-${index}`);
   });
 }
 
@@ -352,6 +368,7 @@ export default function ConversationMessage({
         "code",
         "option",
       ],
+      ignoredClasses: ["math-literal"],
       throwOnError: false,
       trust: false,
     });

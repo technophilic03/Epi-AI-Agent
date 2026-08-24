@@ -229,7 +229,12 @@ describe("ConversationMessage", () => {
       />,
     );
 
-    await waitFor(() => expect(container).toHaveTextContent("$15"));
+    await waitFor(() => {
+      expect(container.querySelector(".message-body"))
+        .toHaveTextContent("The visit costs $15.");
+    });
+    expect(container.querySelector(".message-body"))
+      .not.toHaveTextContent("\\$15");
     expect(container.querySelector(".katex")).toBeNull();
   });
 

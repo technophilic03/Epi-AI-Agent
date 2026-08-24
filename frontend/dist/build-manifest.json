@@ -1,5 +1,5 @@
 {
-  "built_at": "2026-08-24T16:24:48.944616+00:00",
+  "built_at": "2026-08-24T16:29:22.675215+00:00",
   "source_sha256": {
     "frontend/index.html": "89f2b276eb183f4ebfe35982a0cac2d863da771436560c61d977e282ee15b07a",
     "frontend/package-lock.json": "a14f127c2e852575ffd49c7e3c4c5e342da58af5f92b45622f0963064b0ad1d5",
@@ -24,8 +24,8 @@
     "frontend/src/CodeBlock.tsx": "5ef0a2c50a68cabc4a70d5105a9013a2dd8371b0577c0b246b6206cea5de4868",
     "frontend/src/ConversationHistory.test.tsx": "b5166f541cac039a781230c1562f4d395e120f23ea35431d18ec7de765bb74b7",
     "frontend/src/ConversationHistory.tsx": "9d72ed00cf53e6df017a689df2a8240679e5ca20c5be0f1a3c6d30afdc5562e5",
-    "frontend/src/ConversationMessage.test.tsx": "867d3c53c3244dfbcd8f7f40aa7a43c3b54a51707397011507eb22b9272c6bf0",
-    "frontend/src/ConversationMessage.tsx": "c127a2e0eb8ad8d3ceec7f1f602f1590557959d6d98c15da5b23b065f3c44fa2",
+    "frontend/src/ConversationMessage.test.tsx": "54135a1e0cb5f2a07d78d9a3680974aceef6a5c48d235e893173e7117c5d3f1d",
+    "frontend/src/ConversationMessage.tsx": "27fafd38da4f15970cb0afc380f5dc77c3dfa28a18123f19411702270fabaf19",
     "frontend/src/DbRagDatasetReview.test.tsx": "d847bd2dae718a5988136db0202e0438fc26af7294704ddf8909ab8806894acc",
     "frontend/src/DbRagDatasetReview.tsx": "d3b9c3d604c28a2034f0aeaf0ff90892eae02e9cdb0d609149d54f0b0d80032b",
     "frontend/src/DbRagReview.test.tsx": "2cb050f46d6a5c0425d4ea2489d33b651c492e077fc2b0d266cb2fc395bfe100",
