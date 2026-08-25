@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,12 +22,6 @@ class WeatherArgs(BaseModel):
     city: str = Field(min_length=1, max_length=200)
     start_date: str | None = Field(default=None, max_length=10)
     end_date: str | None = Field(default=None, max_length=10)
-
-
-class WeatherTipsArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    season: Literal["spring", "summer", "autumn", "winter"]
 
 
 class SearchArgs(BaseModel):
@@ -92,18 +86,6 @@ class QueryWeatherTool(_GeneralMcpTool):
     )
 
 
-class GetWeatherTipsTool(_GeneralMcpTool):
-    server = "weather"
-    operation = "get_weather_tips"
-    spec = ToolSpec(
-        name="general-get_weather_tips",
-        description="Get concise general advice for a named season.",
-        args_model=WeatherTipsArgs,
-        read_only=True,
-        interrupting=False,
-    )
-
-
 class SearchWebTool(_GeneralMcpTool):
     server = "search"
     operation = "search"
@@ -124,7 +106,6 @@ def build_general_tool_registry() -> ToolRegistry:
         [
             RequestClarificationTool(),
             QueryWeatherTool(),
-            GetWeatherTipsTool(),
             SearchWebTool(),
         ]
     )

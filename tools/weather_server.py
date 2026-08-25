@@ -178,20 +178,5 @@ async def query_weather(
     return format_weather(data)
 
 
-@mcp.tool()
-async def get_weather_tips(season: str) -> str:
-    """
-    Return season-specific weather tips.
-    :param season: season name (spring, summer, autumn, winter)
-    """
-    tips = {
-        "spring": "Spring is windy. Dress in layers and watch for allergies.",
-        "summer": "Summer is hot. Stay hydrated and avoid heat exposure.",
-        "autumn": "Autumn is dry. Moisturize and watch temperature shifts.",
-        "winter": "Winter is cold. Keep warm and protect against colds.",
-    }
-    return tips.get(season.lower(), "Unknown season. Stay healthy.")
-
-
 if __name__ == "__main__":
     mcp.run(transport="stdio")

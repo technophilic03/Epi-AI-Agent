@@ -48,7 +48,6 @@ _LABELS = {
         "Waiting for dataset approval",
         "Dataset reviewed",
     ),
-    "general-get_weather_tips": ToolActivityLabels("Preparing weather guidance"),
     "general-query_weather": ToolActivityLabels("Checking the weather"),
     "general-request_clarification": ToolActivityLabels(
         "Preparing a clarification",
