@@ -1,10 +1,5 @@
 {
   "mcpServers": {
-    "calculator": {
-      "command": "python",
-      "args": ["tools/calculator_server.py"],
-      "transport": "stdio"
-    },
     "weather": {
       "command": "python",
       "args": ["tools/weather_server.py"],

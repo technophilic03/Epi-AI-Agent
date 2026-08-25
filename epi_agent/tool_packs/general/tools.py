@@ -37,12 +37,6 @@ class SearchArgs(BaseModel):
     max_results: int = Field(default=5, ge=1, le=10)
 
 
-class CalculateArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expression: str = Field(min_length=1, max_length=500)
-
-
 def _serialize_result(value: Any) -> str:
     return json.dumps(
         value,
@@ -125,18 +119,6 @@ class SearchWebTool(_GeneralMcpTool):
     )
 
 
-class CalculateTool(_GeneralMcpTool):
-    server = "calculator"
-    operation = "calculate"
-    spec = ToolSpec(
-        name="general-calculate",
-        description="Evaluate a bounded arithmetic expression.",
-        args_model=CalculateArgs,
-        read_only=True,
-        interrupting=False,
-    )
-
-
 def build_general_tool_registry() -> ToolRegistry:
     return ToolRegistry(
         [
@@ -144,7 +126,6 @@ def build_general_tool_registry() -> ToolRegistry:
             QueryWeatherTool(),
             GetWeatherTipsTool(),
             SearchWebTool(),
-            CalculateTool(),
         ]
     )
 
