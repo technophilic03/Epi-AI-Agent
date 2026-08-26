@@ -3,6 +3,8 @@
 This is a lightweight local AI agent demo for epidemiological research. It runs
 on macOS and Linux with Python 3.12 and an OpenAI or Anthropic API key.
 
+[Watch the demo video](https://drive.google.com/file/d/1A-N8pTOn6tKcZ_D6DLPc62EWvb2e_68E/view?usp=sharing)
+
 ## Start the demo
 
 ```bash
