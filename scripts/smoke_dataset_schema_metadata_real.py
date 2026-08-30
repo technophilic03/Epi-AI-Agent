@@ -96,7 +96,10 @@ class E2EProcessHarness:
                     f"FastAPI exited early with code {self.process.returncode}."
                 )
             try:
-                response = requests.get(f"{api_url}/api/health", timeout=2)
+                response = requests.get(
+                    f"{api_url}/api/health",
+                    timeout=_request_timeout(deadline, maximum=2),
+                )
                 if response.status_code == 200:
                     return
                 last_error = f"HTTP {response.status_code}"
@@ -105,20 +108,34 @@ class E2EProcessHarness:
             time.sleep(0.25)
         raise TimeoutError(f"FastAPI did not become ready: {last_error}")
 
-    def close(self) -> None:
+    def close(self, *, deadline: float) -> None:
         if self.process is not None:
             self.process.terminate()
             try:
-                self.process.wait(timeout=10)
+                self.process.wait(timeout=_remaining_seconds(deadline))
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=_remaining_seconds(deadline))
+                except subprocess.TimeoutExpired:
+                    pass
         if self._log_handle is not None:
             self._log_handle.close()
 
 
 def _remaining_ms(deadline: float) -> int:
     return max(1, int((deadline - time.monotonic()) * 1000))
+
+
+def _remaining_seconds(deadline: float) -> float:
+    return max(0.01, deadline - time.monotonic())
+
+
+def _request_timeout(deadline: float, *, maximum: float = 10) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Dataset schema smoke deadline reached.")
+    return max(0.05, min(maximum, remaining))
 
 
 def _launch_browser(playwright: Any) -> Any:
@@ -142,11 +159,16 @@ def _thread_id(page: Any, *, deadline: float) -> str:
     return unquote(match.group(1))
 
 
-def _state(api_url: str, thread_id: str) -> dict[str, Any]:
+def _state(
+    api_url: str,
+    thread_id: str,
+    *,
+    deadline: float,
+) -> dict[str, Any]:
     response = requests.get(
         f"{api_url}/api/threads/{thread_id}/state",
         headers=LOCAL_API_HEADERS,
-        timeout=10,
+        timeout=_request_timeout(deadline),
     )
     response.raise_for_status()
     return dict(response.json())
@@ -156,11 +178,13 @@ def _schema(
     api_url: str,
     thread_id: str,
     dataset_id: str,
+    *,
+    deadline: float,
 ) -> dict[str, object]:
     response = requests.get(
         f"{api_url}/api/threads/{thread_id}/datasets/{dataset_id}/schema",
         headers=LOCAL_API_HEADERS,
-        timeout=10,
+        timeout=_request_timeout(deadline),
     )
     response.raise_for_status()
     return dict(response.json().get("schema") or {})
@@ -252,7 +276,9 @@ def _assert_pending_review(
     dataset_id = str(artifact.get("id") or "").strip()
     if not dataset_id or artifact.get("expected_status") != "pending_review":
         raise AssertionError("Dataset review has no pending artifact identity.")
-    _assert_persisted_schema(_schema(api_url, thread_id, dataset_id))
+    _assert_persisted_schema(
+        _schema(api_url, thread_id, dataset_id, deadline=deadline)
+    )
     page.get_by_role("heading", name="Review extracted dataset").wait_for(
         timeout=_remaining_ms(deadline)
     )
@@ -296,6 +322,7 @@ def _write_diagnostics(
     api_url: str,
     page: Any | None,
     thread_id: str | None,
+    deadline: float,
     error: BaseException | None = None,
 ) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -310,10 +337,13 @@ def _write_diagnostics(
             )
         except Exception:
             pass
-    if thread_id:
+    if thread_id and time.monotonic() < deadline:
         try:
             (artifact_dir / "state.json").write_text(
-                json.dumps(_state(api_url, thread_id), indent=2),
+                json.dumps(
+                    _state(api_url, thread_id, deadline=deadline),
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception:
@@ -352,7 +382,7 @@ def _browser_flow(
             thread_id = _thread_id(page, deadline=deadline)
 
             while time.monotonic() < deadline:
-                state = _state(api_url, thread_id)
+                state = _state(api_url, thread_id, deadline=deadline)
                 interrupt = dict(state.get("active_interrupt") or {})
                 interrupt_id = str(interrupt.get("id") or "")
                 interrupt_type = str(interrupt.get("type") or "")
@@ -381,7 +411,12 @@ def _browser_flow(
                     and dict(state.get("run") or {}).get("state") == "done"
                 ):
                     _assert_persisted_schema(
-                        _schema(api_url, thread_id, dataset_id)
+                        _schema(
+                            api_url,
+                            thread_id,
+                            dataset_id,
+                            deadline=deadline,
+                        )
                     )
                     _assert_approved_attachment(
                         page,
@@ -394,6 +429,7 @@ def _browser_flow(
                         api_url=api_url,
                         page=page,
                         thread_id=thread_id,
+                        deadline=deadline,
                     )
                     return
                 run = dict(state.get("run") or {})
@@ -409,6 +445,7 @@ def _browser_flow(
                 api_url=api_url,
                 page=page,
                 thread_id=thread_id,
+                deadline=deadline,
                 error=error,
             )
             raise
@@ -469,8 +506,19 @@ def main(argv: list[str] | None = None) -> int:
             artifact_dir=artifact_dir,
             deadline=deadline,
         )
+    except BaseException as error:
+        _write_diagnostics(
+            artifact_dir,
+            api_url=api_url,
+            page=None,
+            thread_id=None,
+            deadline=deadline,
+            error=error,
+        )
+        print(f"FAIL dataset schema metadata smoke; diagnostics: {artifact_dir}")
+        raise
     finally:
-        harness.close()
+        harness.close(deadline=deadline)
     print(f"PASS dataset schema metadata smoke; diagnostics: {artifact_dir}")
     return 0
 
