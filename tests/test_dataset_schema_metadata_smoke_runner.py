@@ -22,3 +22,6 @@ def test_dataset_schema_metadata_smoke_uses_real_stack() -> None:
     lowered = source.casefold()
     for marker in forbidden:
         assert marker not in lowered
+
+    assert "/api/conversations" in source
+    assert "Save Current Thread" not in source

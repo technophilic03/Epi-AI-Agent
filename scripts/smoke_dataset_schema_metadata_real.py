@@ -15,7 +15,6 @@ import tempfile
 import time
 import traceback
 from typing import Any
-from urllib.parse import unquote
 
 import requests
 
@@ -147,16 +146,25 @@ def _launch_browser(playwright: Any) -> Any:
         return playwright.chromium.launch(channel="chrome")
 
 
-def _thread_id(page: Any, *, deadline: float) -> str:
-    link = page.get_by_role("link", name="Save Current Thread")
-    link.wait_for(timeout=_remaining_ms(deadline))
-    match = re.search(
-        r"/api/threads/([^/]+)/export\.zip$",
-        str(link.get_attribute("href") or ""),
-    )
-    if match is None:
-        raise AssertionError("Could not resolve the active thread ID.")
-    return unquote(match.group(1))
+def _thread_id(api_url: str, *, deadline: float) -> str:
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"{api_url}/api/conversations",
+            headers=LOCAL_API_HEADERS,
+            timeout=_request_timeout(deadline),
+        )
+        response.raise_for_status()
+        items = list(response.json().get("items") or [])
+        if len(items) == 1:
+            thread_id = str(dict(items[0]).get("thread_id") or "").strip()
+            if thread_id:
+                return thread_id
+        elif len(items) > 1:
+            raise AssertionError(
+                f"Isolated smoke runtime exposed multiple threads: {items!r}"
+            )
+        time.sleep(0.25)
+    raise TimeoutError("Could not resolve the active thread ID.")
 
 
 def _state(
@@ -379,7 +387,7 @@ def _browser_flow(
             field = page.get_by_label(MESSAGE_LABEL)
             field.fill(REQUEST)
             page.get_by_role("button", name="Send", exact=True).click()
-            thread_id = _thread_id(page, deadline=deadline)
+            thread_id = _thread_id(api_url, deadline=deadline)
 
             while time.monotonic() < deadline:
                 state = _state(api_url, thread_id, deadline=deadline)
