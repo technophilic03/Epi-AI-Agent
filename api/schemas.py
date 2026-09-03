@@ -78,7 +78,9 @@ class ModelOption(BaseModel):
 
     id: str
     label: str
-    provider: Literal["openai", "anthropic", "openai_compatible"] = "openai"
+    provider: Literal[
+        "openai", "anthropic", "openai_compatible", "openrouter"
+    ] = "openai"
     provider_label: str = "OpenAI"
     supports_sampling_controls: bool
     summary: str

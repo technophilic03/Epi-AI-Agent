@@ -86,7 +86,11 @@ export interface EmbeddingStartupStatus {
   incompatible_study_ids: string[];
 }
 
-export type ModelProvider = "openai" | "anthropic" | "openai_compatible";
+export type ModelProvider =
+  | "openai"
+  | "anthropic"
+  | "openai_compatible"
+  | "openrouter";
 
 export interface ModelOption {
   id: string;

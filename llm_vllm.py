@@ -10,11 +10,18 @@ from utils.model_runtime_profiles import (
     PROVIDER_ANTHROPIC,
     PROVIDER_OPENAI,
     PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_OPENROUTER,
     model_runtime_profile,
 )
 
 
 _COMPAT_PLACEHOLDER_KEY = "not-needed"
+
+# Optional attribution headers OpenRouter shows on its app leaderboards.
+_OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://github.com/technophilic03/Epi-AI-Agent",
+    "X-Title": "Epi-AI-Agent",
+}
 
 
 def resolve_provider_api_key(
@@ -100,6 +107,34 @@ def _build_openai_compatible_chat_llm(
     return ChatOpenAI(**kwargs)
 
 
+def _build_openrouter_chat_llm(
+    profile: ModelRuntimeProfile,
+    api_key: str,
+    *,
+    temperature: float | None,
+    top_p: float | None,
+):
+    # OpenRouter speaks plain chat-completions and carries reasoning settings
+    # in its unified `reasoning` body field, not OpenAI's reasoning_effort.
+    kwargs: dict[str, object] = dict(
+        model=profile.served_model_id,
+        api_key=SecretStr(api_key),
+        base_url=profile.base_url,
+        timeout=profile.request_timeout_seconds,
+        max_retries=0,
+        max_tokens=profile.initial_output_tokens,
+        default_headers=_OPENROUTER_HEADERS,
+    )
+    if profile.reasoning is not None:
+        kwargs["extra_body"] = {"reasoning": {"effort": profile.reasoning.effort}}
+    if profile.supports_sampling_controls:
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+    return ChatOpenAI(**kwargs)
+
+
 def build_chat_llm(
     *,
     model_name: str,
@@ -112,6 +147,13 @@ def build_chat_llm(
     resolved_key = resolve_provider_api_key(profile, api_key=api_key)
     if profile.provider == PROVIDER_ANTHROPIC:
         return _build_anthropic_chat_llm(profile, resolved_key)
+    if profile.provider == PROVIDER_OPENROUTER:
+        return _build_openrouter_chat_llm(
+            profile,
+            resolved_key,
+            temperature=temperature,
+            top_p=top_p,
+        )
     if profile.provider == PROVIDER_OPENAI_COMPATIBLE:
         return _build_openai_compatible_chat_llm(
             profile,

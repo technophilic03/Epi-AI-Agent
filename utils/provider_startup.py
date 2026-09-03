@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from utils.model_runtime_profiles import OPENROUTER_BASE_URL
+
 
 class ProviderCredentialError(RuntimeError):
     def __init__(self, kind: str, message: str) -> None:
@@ -24,6 +26,10 @@ def _status_failure(provider_label: str, status_code: int) -> ProviderCredential
         403: (
             "authorization",
             f"The {bare_label} API key is not authorized for this project.",
+        ),
+        402: (
+            "credits",
+            f"The {bare_label} account has no remaining credits. Add credits and try again.",
         ),
         429: (
             "temporary",
@@ -82,6 +88,40 @@ def verify_openai_credentials(
         raise _status_failure(provider_label, status_code) from error
 
 
+def verify_openrouter_credentials(
+    api_key: str,
+    *,
+    base_url: str | None = None,
+    request_fn: Callable[..., Any] | None = None,
+) -> None:
+    import httpx
+
+    normalized_key = str(api_key or "").strip()
+    if not normalized_key:
+        raise ProviderCredentialError(
+            "missing",
+            "An OpenRouter API key is required.",
+        )
+    # OpenRouter serves /models without authentication, so listing models
+    # proves nothing about the key; /key rejects an invalid credential.
+    endpoint = f"{(base_url or OPENROUTER_BASE_URL).rstrip('/')}/key"
+    getter = request_fn or httpx.get
+    try:
+        response = getter(
+            endpoint,
+            headers={"Authorization": f"Bearer {normalized_key}"},
+            timeout=10.0,
+        )
+    except httpx.RequestError as error:
+        raise ProviderCredentialError(
+            "network",
+            "OpenRouter could not be reached. Check your network and try again.",
+        ) from error
+    status_code = int(response.status_code)
+    if status_code >= 400:
+        raise _status_failure("OpenRouter", status_code)
+
+
 def verify_anthropic_credentials(
     api_key: str,
     *,
@@ -118,6 +158,7 @@ def verify_provider_credential(
     base_url: str | None = None,
     openai_checker: Callable[..., None] = verify_openai_credentials,
     anthropic_checker: Callable[..., None] = verify_anthropic_credentials,
+    openrouter_checker: Callable[..., None] = verify_openrouter_credentials,
 ) -> None:
     normalized_provider = str(provider or "").strip().lower()
     if normalized_provider == "openai":
@@ -125,6 +166,9 @@ def verify_provider_credential(
         return
     if normalized_provider == "anthropic":
         anthropic_checker(api_key)
+        return
+    if normalized_provider == "openrouter":
+        openrouter_checker(api_key, base_url=base_url)
         return
     if normalized_provider == "openai_compatible":
         openai_checker(
@@ -164,5 +208,6 @@ __all__ = [
     "verify_active_provider",
     "verify_anthropic_credentials",
     "verify_openai_credentials",
+    "verify_openrouter_credentials",
     "verify_provider_credential",
 ]

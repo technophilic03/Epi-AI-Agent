@@ -33,8 +33,8 @@ python run_fastapi.py
 ```
 
 The installer prompts for a study-package folder. On first startup, choose a
-runtime-data folder and configure OpenAI or Anthropic. To change providers
-later, run `python run_fastapi.py --reconfigure`.
+runtime-data folder and configure OpenAI, Anthropic, or OpenRouter. To change
+providers later, run `python run_fastapi.py --reconfigure`.
 
 By default, the application is available at:
 
@@ -44,6 +44,14 @@ By default, the application is available at:
 
 - `OPENAI_API_KEY` enables the registered OpenAI models.
 - `ANTHROPIC_API_KEY` enables the registered Anthropic models.
+- `OPENROUTER_API_KEY` enables the OpenRouter models you register.
+
+OpenRouter ships no built-in model list.
+Copy `config/custom_models.example.json` to `config/custom_models.json` and add
+one entry per model, setting `"provider": "openrouter"` and using the OpenRouter
+slug (for example `anthropic/claude-sonnet-4.5`) as `model`.
+`base_url` and `api_key_env` default to OpenRouter's endpoint and
+`OPENROUTER_API_KEY`; add `"reasoning_effort"` to enable reasoning.
 
 Semantic search uses the built-in OpenAI `text-embedding-3-large` model and
 requires `OPENAI_API_KEY`, even when the chat model is Claude. If OpenAI

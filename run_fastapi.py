@@ -30,7 +30,12 @@ from utils.model_availability import (
     profile_endpoint,
     registered_model_profiles,
 )
-from utils.model_runtime_profiles import PROVIDER_OPENAI_COMPATIBLE
+from utils.model_runtime_profiles import (
+    OPENROUTER_BASE_URL,
+    PROVIDER_API_KEY_ENVS,
+    PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_OPENROUTER,
+)
 from utils.provider_startup import (
     ProviderCredentialError,
     verify_active_provider,
@@ -69,14 +74,18 @@ def _provider_label(provider: str) -> str:
         "openai": "OpenAI",
         "anthropic": "Anthropic",
         PROVIDER_OPENAI_COMPATIBLE: "Compatible endpoint",
+        PROVIDER_OPENROUTER: "OpenRouter",
     }.get(provider, provider)
 
 
 def _builtin_endpoint(provider: str) -> ProviderEndpoint:
     return ProviderEndpoint(
         provider=provider,
-        api_key_env=(
-            "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+        api_key_env=PROVIDER_API_KEY_ENVS[provider],
+        # OpenRouter is keyed per endpoint, so this must match the base_url
+        # carried by its registered profiles.
+        base_url=(
+            OPENROUTER_BASE_URL if provider == PROVIDER_OPENROUTER else None
         ),
     )
 
@@ -142,24 +151,31 @@ def _configure_provider_menu(
             profile.provider == PROVIDER_OPENAI_COMPATIBLE
             for profile in profiles.values()
         )
+        has_openrouter = any(
+            profile.provider == PROVIDER_OPENROUTER
+            for profile in profiles.values()
+        )
         if force:
             prompt = (
                 "Configure AI providers. Existing providers are retained.\n\n"
                 "1. Configure or replace OpenAI (preferred)\n"
                 "2. Configure or replace Anthropic\n"
-                "3. Connect to a compatible endpoint (beta)\n"
-                "4. Remove OpenAI\n"
-                "5. Remove Anthropic\n"
-                "6. Keep current providers\n"
-                "Selection [6]: "
+                "3. Configure or replace OpenRouter\n"
+                "4. Connect to a compatible endpoint (beta)\n"
+                "5. Remove OpenAI\n"
+                "6. Remove Anthropic\n"
+                "7. Remove OpenRouter\n"
+                "8. Keep current providers\n"
+                "Selection [8]: "
             )
-            default = "6"
+            default = "8"
         else:
             prompt = (
                 "No AI provider is configured.\n\n"
                 "1. Configure OpenAI (preferred)\n"
                 "2. Configure Anthropic\n"
-                "3. Connect to a compatible endpoint (beta)\n"
+                "3. Configure OpenRouter\n"
+                "4. Connect to a compatible endpoint (beta)\n"
                 "Selection: "
             )
             default = ""
@@ -173,6 +189,7 @@ def _configure_provider_menu(
         providers = {
             "1": ("openai",),
             "2": ("anthropic",),
+            "3": (PROVIDER_OPENROUTER,),
         }.get(selection)
         if providers is not None:
             configured_any = False
@@ -190,9 +207,16 @@ def _configure_provider_menu(
                     or configured_any
                 )
             if configured_any:
+                if PROVIDER_OPENROUTER in providers and not has_openrouter:
+                    output_fn(
+                        "No OpenRouter models are registered. Copy "
+                        "config/custom_models.example.json to "
+                        "config/custom_models.json and list the OpenRouter "
+                        "models to enable."
+                    )
                 return
             continue
-        if selection == "3":
+        if selection == "4":
             if has_custom:
                 return
             output_fn(
@@ -201,12 +225,14 @@ def _configure_provider_menu(
                 "config/custom_models.json, edit the endpoint, and retry."
             )
             continue
-        if force and selection in {"4", "5"}:
-            key = "OPENAI_API_KEY" if selection == "4" else "ANTHROPIC_API_KEY"
+        if force and selection in {"5", "6", "7"}:
+            key = PROVIDER_API_KEY_ENVS[
+                {"5": "openai", "6": "anthropic", "7": PROVIDER_OPENROUTER}[selection]
+            ]
             environ.pop(key, None)
             remove_local_env_values(project_root, {key})
             return
-        if force and selection == "6":
+        if force and selection == "8":
             return
         output_fn("Select one of the listed provider options.")
 
@@ -234,7 +260,7 @@ def configure_and_verify_providers(
     )
     has_builtin = any(
         normalize_secret_input(environ.get(key, ""))
-        for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        for key in PROVIDER_API_KEY_ENVS.values()
     )
     if force or (not has_builtin and not custom_exists):
         _configure_provider_menu(
@@ -262,8 +288,8 @@ def configure_and_verify_providers(
         key_required = any(profile.api_key_required for profile in endpoint_profiles)
         if endpoint.api_key_env and key_required and not key:
             output_fn(
-                f"Warning: {endpoint.api_key_env} is required by compatible "
-                f"endpoint {endpoint.base_url}; its models are unavailable."
+                f"Warning: {endpoint.api_key_env} is required by endpoint "
+                f"{endpoint.base_url}; its models are unavailable."
             )
             continue
         try:

@@ -11,28 +11,34 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-Provider = Literal["openai", "anthropic", "openai_compatible"]
+Provider = Literal["openai", "anthropic", "openai_compatible", "openrouter"]
 ReasoningMode = Literal["adaptive"]
 ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 PROVIDER_OPENAI: Provider = "openai"
 PROVIDER_ANTHROPIC: Provider = "anthropic"
 PROVIDER_OPENAI_COMPATIBLE: Provider = "openai_compatible"
+PROVIDER_OPENROUTER: Provider = "openrouter"
 
 PROVIDER_LABELS: dict[str, str] = {
     PROVIDER_OPENAI: "OpenAI",
     PROVIDER_ANTHROPIC: "Anthropic",
     PROVIDER_OPENAI_COMPATIBLE: "Custom endpoint",
+    PROVIDER_OPENROUTER: "OpenRouter",
 }
+
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 PROVIDER_API_KEY_ENVS: dict[str, str] = {
     PROVIDER_OPENAI: "OPENAI_API_KEY",
     PROVIDER_ANTHROPIC: "ANTHROPIC_API_KEY",
+    PROVIDER_OPENROUTER: OPENROUTER_API_KEY_ENV,
 }
 
 CUSTOM_MODELS_PATH_ENV = "REPORT_AGENT_CUSTOM_MODELS_PATH"
@@ -111,6 +117,13 @@ class ModelRuntimeProfile:
                 raise ValueError(
                     "reasoning is not supported for openai_compatible models"
                 )
+        elif self.provider == PROVIDER_OPENROUTER:
+            if self.reasoning is not None and self.reasoning.mode is not None:
+                raise ValueError(
+                    f"{self.model_id} reasoning mode is not supported by OpenRouter"
+                )
+            if not self.base_url:
+                raise ValueError(f"{self.model_id} requires an OpenRouter base_url")
 
     @property
     def reasoning_display(self) -> str:
@@ -313,15 +326,17 @@ INTERNAL_MODEL_RUNTIME_PROFILES = {
 
 
 class CustomModelEntry(BaseModel):
-    """One operator-registered OpenAI-compatible (e.g. vLLM) model."""
+    """One operator-registered OpenAI-compatible (e.g. vLLM) or OpenRouter model."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=200)
-    base_url: str = Field(min_length=1)
+    provider: Literal["openai_compatible", "openrouter"] = PROVIDER_OPENAI_COMPATIBLE
+    base_url: str = ""
     label: str = ""
     model: str = ""
     api_key_env: str = ""
+    reasoning_effort: ReasoningEffort | None = None
     summary: str = ""
     initial_output_tokens: int = Field(default=8_192, gt=0)
     automatic_output_token_ceiling: int = Field(default=16_384, gt=0)
@@ -335,6 +350,12 @@ class CustomModelEntry(BaseModel):
     supports_sampling_controls: bool = True
     routing_context_char_ceiling: int = Field(default=262_144, gt=0)
 
+    @model_validator(mode="after")
+    def _require_endpoint(self) -> "CustomModelEntry":
+        if self.provider == PROVIDER_OPENAI_COMPATIBLE and not self.base_url.strip():
+            raise ValueError(f"Custom model {self.id!r} requires a base_url.")
+        return self
+
     def to_profile(self) -> ModelRuntimeProfile:
         price: Decimal | None = None
         if self.output_usd_per_million is not None:
@@ -345,12 +366,35 @@ class CustomModelEntry(BaseModel):
                     f"Custom model {self.id!r} has an invalid "
                     "output_usd_per_million value."
                 ) from exc
+        is_openrouter = self.provider == PROVIDER_OPENROUTER
+        base_url = self.base_url.strip()
+        if not base_url and is_openrouter:
+            base_url = OPENROUTER_BASE_URL
+        api_key_env = self.api_key_env.strip() or (
+            OPENROUTER_API_KEY_ENV if is_openrouter else ""
+        )
+        # OpenRouter fronts chat-completions models that accept a system turn
+        # anywhere; self-hosted chat templates frequently do not.
+        supports_system = (
+            self.supports_mid_conversation_system
+            if "supports_mid_conversation_system" in self.model_fields_set
+            else is_openrouter
+        )
+        default_summary = (
+            "Operator-registered OpenRouter model."
+            if is_openrouter
+            else "Operator-registered custom endpoint model."
+        )
         return ModelRuntimeProfile(
             model_id=self.id,
             base_label=self.label or self.id,
-            reasoning=None,
+            reasoning=(
+                ReasoningConfig(effort=self.reasoning_effort)
+                if self.reasoning_effort is not None
+                else None
+            ),
             supports_sampling_controls=self.supports_sampling_controls,
-            summary=self.summary or "Operator-registered custom endpoint model.",
+            summary=self.summary or default_summary,
             initial_output_tokens=self.initial_output_tokens,
             automatic_output_token_ceiling=self.automatic_output_token_ceiling,
             user_output_token_increment=self.user_output_token_increment,
@@ -359,15 +403,13 @@ class CustomModelEntry(BaseModel):
             workflow_timeout_seconds=self.workflow_timeout_seconds,
             routing_context_char_ceiling=self.routing_context_char_ceiling,
             output_usd_per_million=price,
-            provider=PROVIDER_OPENAI_COMPATIBLE,
-            api_key_env=self.api_key_env,
-            api_key_required=bool(self.api_key_env.strip()),
-            base_url=self.base_url,
+            provider=self.provider,
+            api_key_env=api_key_env,
+            api_key_required=bool(api_key_env),
+            base_url=base_url,
             remote_model_id=self.model or self.id,
             supports_vision=self.supports_vision,
-            supports_mid_conversation_system=(
-                self.supports_mid_conversation_system
-            ),
+            supports_mid_conversation_system=supports_system,
         )
 
 
@@ -479,8 +521,11 @@ __all__ = [
     "PROVIDER_ANTHROPIC",
     "PROVIDER_API_KEY_ENVS",
     "PROVIDER_LABELS",
+    "OPENROUTER_API_KEY_ENV",
+    "OPENROUTER_BASE_URL",
     "PROVIDER_OPENAI",
     "PROVIDER_OPENAI_COMPATIBLE",
+    "PROVIDER_OPENROUTER",
     "Provider",
     "configured_model_profiles",
     "custom_models_path",

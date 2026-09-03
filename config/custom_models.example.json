@@ -14,5 +14,21 @@
     "workflow_timeout_seconds": 300,
     "output_usd_per_million": null,
     "supports_vision": false
+  },
+  {
+    "id": "openrouter:claude-sonnet-4.5",
+    "provider": "openrouter",
+    "label": "Claude Sonnet 4.5 (OpenRouter)",
+    "model": "anthropic/claude-sonnet-4.5",
+    "reasoning_effort": "medium",
+    "summary": "Claude Sonnet 4.5 served through OpenRouter.",
+    "initial_output_tokens": 16384,
+    "automatic_output_token_ceiling": 32768,
+    "user_output_token_increment": 16384,
+    "absolute_output_token_ceiling": 65536,
+    "request_timeout_seconds": 180,
+    "workflow_timeout_seconds": 420,
+    "output_usd_per_million": "15",
+    "supports_vision": true
   }
 ]

@@ -57,6 +57,12 @@ def _classify_openai_error(exc: Exception) -> tuple[str, str] | None:
             "The configured API project is not allowed to use this resource. "
             "Check the project's permissions or use another API key.",
         )
+    if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
+        return _public_failure(
+            "PROVIDER_CREDITS_EXHAUSTED",
+            "The provider account has no remaining API credits. Add "
+            "credits or use a funded API key, then retry.",
+        )
     body = exc.body if isinstance(exc, openai.APIStatusError) else {}
     markers = _body_markers(body)
     if isinstance(exc, openai.RateLimitError):
